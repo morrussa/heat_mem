@@ -68,10 +68,6 @@ class Config:
     STATS_TABLE = "system_stats"
     OPERATION_LOG_TABLE = "operation_log"  # 操作日志表
     
-    # 指数分配参数
-    EXPONENT_BASE = 2.0  # 指数分配的底数
-    MIN_ALLOCATION_RATIO = 0.01  # 最小分配比例
-    
     # 系统参数
     BACKGROUND_THREADS = 4  # 后台线程数
     CLUSTER_LOAD_BATCH_SIZE = 50  # 簇加载批大小
@@ -84,6 +80,32 @@ class Config:
     # 锁配置
     MEMORY_LOCK_TIMEOUT = 5  # 内存锁超时时间（秒）
     CLUSTER_LOCK_TIMEOUT = 3  # 簇锁超时时间（秒）
+    
+    # 新增：基于轮数的时间系统配置
+    INITIAL_TURN = 0  # 初始轮数
+    TURN_INCREMENT_ON_ACCESS = 1  # 每次访问记忆时增加的轮数
+    TURN_INCREMENT_ON_ADD = 1  # 每次添加记忆时增加的轮数
+    TURN_INCREMENT_ON_MAINTENANCE = 1  # 每次维护时增加的轮数
+    
+    # 新增：簇内搜索配置
+    CLUSTER_SEARCH_MAX_RESULTS = 20  # 簇内搜索返回的最大记忆数量
+    ACCESS_FREQUENCY_DISCOUNT_THRESHOLD = 50  # 访问频率折扣阈值（超过此次数开始减权）
+    ACCESS_FREQUENCY_DISCOUNT_FACTOR = 0.7  # 访问频率折扣因子
+    RECENCY_WEIGHT_DECAY_PER_TURN = 0.001  # 每轮访问权重衰减因子
+    RELATIVE_HEAT_WEIGHT_POWER = 0.5  # 相对热力权重幂指数（用于平滑权重分布）
+    
+    # 新增：簇内搜索缓存配置
+    CLUSTER_SEARCH_CACHE_SIZE = 50  # 簇内搜索缓存大小（按簇ID）
+    CLUSTER_SEARCH_CACHE_TTL_TURNS = 100  # 簇内搜索缓存TTL（轮数）
+    
+    # 新增：热力分布控制配置
+    TOP3_HEAT_LIMIT_RATIO = 0.60  # 前3个簇热力占比上限 60%
+    TOP5_HEAT_LIMIT_RATIO = 0.75  # 前5个簇热力占比上限 75%
+    HEAT_RECYCLE_CHECK_FREQUENCY = 2  # 每2次维护任务检查一次热力分布
+    HEAT_RECYCLE_SUPPRESSION_TURNS = 50  # 热力回收抑制期轮数
+    HEAT_SUPPRESSION_FACTOR = 0.7  # 抑制期内新增热力系数
+    MIN_CLUSTER_HEAT_AFTER_RECYCLE = 100  # 回收后簇的最小热力
+    HEAT_RECYCLE_RATE = 0.1  # 每次回收比例（线性）
 
 # =============== 枚举和常量 ===============
 class OperationType(Enum):
@@ -112,7 +134,6 @@ class TransactionContext:
         self.operations = []  # 记录所有操作
         self.memory_updates = {}  # memory_id -> (old_heat, new_heat)
         self.cluster_updates = {}  # cluster_id -> heat_delta
-        self.started_at = time.time()
         self.transaction_id = str(uuid.uuid4())
         self.transaction_started = False  # 跟踪事务是否由我们开始
     
@@ -149,50 +170,47 @@ class TransactionContext:
             if self.consistency_level == ConsistencyLevel.STRONG and self.transaction_started:
                 self.memory_module._finalize_transaction(self.transaction_id, False)
     
-    def add_memory_heat_update(self, memory_id: str, old_heat: int, new_heat: int, cluster_id: str = None):
+    def add_memory_heat_update(self, memory_id: str, old_heat: int, new_heat: int, cluster_id: Optional[str] = None):
         """添加记忆热力更新操作"""
-        self.operations.append({
+        operation = {
             'type': OperationType.MEMORY_HEAT_UPDATE,
             'memory_id': memory_id,
             'old_heat': old_heat,
             'new_heat': new_heat,
             'cluster_id': cluster_id,
-            'timestamp': time.time()
-        })
-        
-        # 记录热力变化
-        heat_delta = new_heat - old_heat
-        if cluster_id and heat_delta != 0:
-            if cluster_id not in self.cluster_updates:
-                self.cluster_updates[cluster_id] = 0
-            self.cluster_updates[cluster_id] += heat_delta
+            'transaction_id': self.transaction_id
+        }
+        self.operations.append(operation)
+        self.memory_updates[memory_id] = (old_heat, new_heat)
     
     def add_cluster_heat_update(self, cluster_id: str, heat_delta: int):
         """添加簇热力更新操作"""
-        self.operations.append({
+        operation = {
             'type': OperationType.CLUSTER_HEAT_UPDATE,
             'cluster_id': cluster_id,
             'heat_delta': heat_delta,
-            'timestamp': time.time()
-        })
+            'transaction_id': self.transaction_id
+        }
+        self.operations.append(operation)
+        self.cluster_updates[cluster_id] = self.cluster_updates.get(cluster_id, 0) + heat_delta
 
 # =============== 数据类定义 ===============
 @dataclass
 class MemoryItem:
-    """记忆项"""
+    """记忆项 - 使用轮数作为时间锚点"""
     id: str
     vector: np.ndarray
     content: str
     heat: int = 0
-    last_accessed: float = field(default_factory=time.time)
+    created_turn: int = 0  # 创建时的轮数（替换created_at）
+    last_interaction_turn: int = 0  # 上一次交互的轮数（替换last_accessed）
     access_count: int = 1
     is_hot: bool = True
     is_sleeping: bool = False
     cluster_id: Optional[str] = None
-    created_at: float = field(default_factory=time.time)
     metadata: Dict[str, Any] = field(default_factory=dict)
     version: int = 1  # 版本号，用于乐观锁
-    pending_updates: List[Dict] = field(default_factory=list)  # 待应用的更新
+    update_count: int = 0  # 记忆更新次数（数据库维护）
     
     def to_dict(self) -> Dict:
         """转换为字典"""
@@ -219,12 +237,105 @@ class SemanticCluster:
     memory_ids: Set[str] = field(default_factory=set)  # 使用集合避免重复
     is_loaded: bool = False
     size: int = 0
-    last_updated: float = field(default_factory=time.time)
+    last_updated_turn: int = 0  # 上次更新的轮数
     version: int = 1
     lock: threading.RLock = field(default_factory=threading.RLock)  # 每个簇有自己的锁
     pending_heat_delta: int = 0  # 待应用的热力变化
     pending_centroid_updates: List[Tuple[np.ndarray, bool]] = field(default_factory=list)  # (向量, add=True/remove=False)
     memory_additions_since_last_update: int = 0  # 上次更新后新增的记忆数
+
+# =============== 加权记忆搜索结果 ===============
+@dataclass
+class WeightedMemoryResult:
+    """加权记忆搜索结果"""
+    memory: MemoryItem
+    base_similarity: float  # 基础相似度（与查询向量的相似度）
+    relative_heat_weight: float  # 相对热力权重
+    access_frequency_weight: float  # 访问频率权重
+    recency_weight: float  # 最近访问权重（基于轮数间隔）
+    final_score: float  # 最终加权得分
+    ranking_position: int  # 排名位置
+
+# =============== 簇内搜索缓存 ===============
+class ClusterSearchCache:
+    """簇内搜索缓存（基于轮数的TTL）"""
+    
+    def __init__(self, max_size: int = 50, ttl_turns: int = 100):
+        self.max_size = max_size
+        self.ttl_turns = ttl_turns
+        self.cache: Dict[str, Dict[str, Any]] = {}
+        self.access_turns: Dict[str, int] = {}  # 使用轮数而不是时间戳
+        self.lock = threading.RLock()
+    
+    def get(self, cluster_id: str, query_vector: np.ndarray, current_turn: int) -> Optional[List[WeightedMemoryResult]]:
+        """从缓存获取搜索结果"""
+        with self.lock:
+            if cluster_id not in self.cache:
+                return None
+            
+            cache_entry = self.cache[cluster_id]
+            
+            # 检查缓存是否过期（基于轮数）
+            if current_turn - cache_entry['created_turn'] > self.ttl_turns:
+                del self.cache[cluster_id]
+                del self.access_turns[cluster_id]
+                return None
+            
+            # 检查查询向量是否相同（使用近似比较）
+            cached_vector = cache_entry['query_vector']
+            if not self._vectors_similar(query_vector, cached_vector):
+                return None
+            
+            # 更新访问轮数
+            self.access_turns[cluster_id] = current_turn
+            
+            return cache_entry['results']
+    
+    def put(self, cluster_id: str, query_vector: np.ndarray, results: List[WeightedMemoryResult], current_turn: int):
+        """将搜索结果放入缓存"""
+        with self.lock:
+            # 如果缓存已满，移除最久未访问的条目
+            if len(self.cache) >= self.max_size:
+                # 找到最久未访问的簇
+                oldest_cluster = None
+                oldest_turn = float('inf')
+                for cid, aturn in self.access_turns.items():
+                    if aturn < oldest_turn:
+                        oldest_turn = aturn
+                        oldest_cluster = cid
+                
+                if oldest_cluster:
+                    del self.cache[oldest_cluster]
+                    del self.access_turns[oldest_cluster]
+            
+            # 添加新条目
+            self.cache[cluster_id] = {
+                'query_vector': query_vector.copy(),
+                'results': results,
+                'created_turn': current_turn
+            }
+            self.access_turns[cluster_id] = current_turn
+    
+    def clear(self, cluster_id: str = None):
+        """清除缓存"""
+        with self.lock:
+            if cluster_id:
+                if cluster_id in self.cache:
+                    del self.cache[cluster_id]
+                if cluster_id in self.access_turns:
+                    del self.access_turns[cluster_id]
+            else:
+                self.cache.clear()
+                self.access_turns.clear()
+    
+    def _vectors_similar(self, vec1: np.ndarray, vec2: np.ndarray, threshold: float = 0.99) -> bool:
+        """检查两个向量是否相似（用于缓存键值比较）"""
+        norm1 = np.linalg.norm(vec1)
+        norm2 = np.linalg.norm(vec2)
+        if norm1 == 0 or norm2 == 0:
+            return False
+        similarity = np.dot(vec1, vec2) / (norm1 * norm2)
+        return similarity >= threshold
 
 # =============== 分布式锁管理器 ===============
 class DistributedLockManager:
@@ -299,10 +410,14 @@ class DistributedLockManager:
 
 # =============== 核心内存管理模块 ===============
 class MemoryModule:
-    """内存管理模块 - 纯事件驱动设计"""
+    """内存管理模块 - 纯事件驱动设计，基于轮数的时间系统"""
     
     def __init__(self, embedding_func=None, similarity_func=None):
         self.config = Config()
+        
+        # 基于轮数的时间系统
+        self.current_turn = self.config.INITIAL_TURN  # 当前轮数（全局时间锚点）
+        self.turn_lock = threading.RLock()
         
         # 纯事件驱动配置（完全移除定时器）
         self.CHECKPOINT_MEMORY_THRESHOLD = 100  # 每添加100次记忆创建检查点
@@ -313,6 +428,7 @@ class MemoryModule:
         self.memory_addition_count = 0
         self.operation_count = 0
         self.memory_additions_since_last_centroid_update: int = 0
+        self.maintenance_cycles_since_heat_check: int = 0  # 新增：热力分布检查计数器
         
         # 从外部传入的嵌入函数和相似度函数
         self._external_embedding_func = embedding_func
@@ -358,6 +474,21 @@ class MemoryModule:
         # 纯事件驱动：没有定时维护线程
         self.running = True
         
+        # 新增：簇内搜索缓存
+        self.cluster_search_cache = ClusterSearchCache(
+            max_size=self.config.CLUSTER_SEARCH_CACHE_SIZE,
+            ttl_turns=self.config.CLUSTER_SEARCH_CACHE_TTL_TURNS
+        )
+        
+        # 新增：访问频率统计（基于轮数）
+        self.access_frequency_stats: Dict[str, Dict[str, Any]] = {}  # memory_id -> {'count': int, 'last_reset_turn': int}
+        self.frequency_stats_lock = threading.RLock()
+        
+        # 新增：热力分布控制相关
+        self.last_heat_recycle_turn: int = 0  # 上次热力回收的轮数
+        self.heat_recycle_count: int = 0  # 热力回收次数统计
+        self.cluster_heat_history: Dict[str, List[Tuple[int, int]]] = {}  # 簇热力历史记录 (turn, heat)
+        
         # 统计信息
         self.stats = {
             'total_memories': 0,
@@ -367,26 +498,51 @@ class MemoryModule:
             'loaded_clusters': 0,
             'total_heat_recycled': 0,
             'total_heat_allocated': 0,
-            'last_recycle_time': 0,
+            'last_recycle_turn': 0,
             'consistency_violations': 0,
             'transaction_retries': 0,
             'centroid_updates': 0,
             'full_centroid_recalculations': 0,
             'maintenance_cycles': 0,
-            'events_triggered': 0
+            'events_triggered': 0,
+            'cluster_searches': 0,
+            'cache_hits': 0,
+            'cache_misses': 0,
+            'weight_adjustments': 0,
+            'high_frequency_memories': 0,
+            'current_turn': self.current_turn,
+            'heat_redistributions': 0,  # 新增
+            'heat_recycled_to_pool': 0,  # 新增
+            'suppressed_memory_additions': 0,  # 新增
         }
         
         # 加载系统状态
         self._load_system_state()
         
-        print(f"Memory Module initialized with PURE event-driven design")
+        print(f"Memory Module initialized with PURE event-driven design and TURN-based time system")
         print(f"No background maintenance threads - all maintenance triggered by events")
+        print(f"Current turn: {self.current_turn}")
         print(f"Embedding model: {'External' if self._external_embedding_func else 'Internal'}")
         print(f"Checkpoint threshold: {self.CHECKPOINT_MEMORY_THRESHOLD} memory additions")
         print(f"Consistency threshold: {self.CONSISTENCY_CHECK_THRESHOLD} operations")
         print(f"Maintenance threshold: {self.MAINTENANCE_OPERATION_THRESHOLD} total operations")
         print(f"Duplicate detection: {'Enabled' if self.config.DUPLICATE_CHECK_ENABLED else 'Disabled'} "
               f"(threshold: {self.config.DUPLICATE_THRESHOLD})")
+        print(f"Cluster search enabled with cache size {self.config.CLUSTER_SEARCH_CACHE_SIZE}")
+        print(f"Heat distribution control enabled: Top 3 ≤ {self.config.TOP3_HEAT_LIMIT_RATIO:.0%}, "
+              f"Top 5 ≤ {self.config.TOP5_HEAT_LIMIT_RATIO:.0%}")
+    
+    def _increment_turn(self, increment: int = 1) -> int:
+        """增加轮数并返回新的轮数"""
+        with self.turn_lock:
+            self.current_turn += increment
+            self.stats['current_turn'] = self.current_turn
+            return self.current_turn
+    
+    def get_current_turn(self) -> int:
+        """获取当前轮数"""
+        with self.turn_lock:
+            return self.current_turn
     
     def _init_model(self):
         """初始化嵌入模型（只有当外部没有传入模型时才调用）"""
@@ -415,33 +571,33 @@ class MemoryModule:
             self.embedding_dim = self.config.EMBEDDING_DIM
     
     def _init_database(self):
-        """初始化数据库表结构"""
+        """初始化数据库表结构（使用轮数而非时间戳）"""
         self.conn = sqlite3.connect(self.config.DB_PATH, check_same_thread=False, timeout=30)
         self.conn.execute("PRAGMA journal_mode=WAL")  # 启用WAL模式提高并发
         self.conn.execute("PRAGMA synchronous=NORMAL")  # 平衡性能和数据安全
         self.conn.row_factory = sqlite3.Row
         self.cursor = self.conn.cursor()
         
-        # 创建统一记忆表
+        # 创建统一记忆表（使用轮数而非时间戳）
         self.cursor.execute(f"""
             CREATE TABLE IF NOT EXISTS {self.config.MEMORY_TABLE} (
                 id TEXT PRIMARY KEY,
                 vector BLOB,
                 content TEXT NOT NULL,
                 heat INTEGER DEFAULT 0,
-                last_accessed REAL,
+                created_turn INTEGER DEFAULT 0,
+                last_interaction_turn INTEGER DEFAULT 0,
                 access_count INTEGER DEFAULT 1,
                 is_hot INTEGER DEFAULT 1,
                 is_sleeping INTEGER DEFAULT 0,
                 cluster_id TEXT,
-                created_at REAL,
                 metadata TEXT,
                 version INTEGER DEFAULT 1,
-                last_updated REAL DEFAULT (strftime('%s', 'now'))
+                update_count INTEGER DEFAULT 0  -- 记忆更新次数，用于乐观锁和时间锚点
             )
         """)
         
-        # 创建簇表
+        # 创建簇表（使用轮数而非时间戳）
         self.cursor.execute(f"""
             CREATE TABLE IF NOT EXISTS {self.config.CLUSTER_TABLE} (
                 id TEXT PRIMARY KEY,
@@ -451,7 +607,7 @@ class MemoryModule:
                 cold_memory_count INTEGER DEFAULT 0,
                 is_loaded INTEGER DEFAULT 0,
                 size INTEGER DEFAULT 0,
-                last_updated REAL,
+                last_updated_turn INTEGER DEFAULT 0,
                 version INTEGER DEFAULT 1,
                 pending_heat_delta INTEGER DEFAULT 0,
                 memory_additions_since_last_update INTEGER DEFAULT 0
@@ -464,11 +620,12 @@ class MemoryModule:
                 id INTEGER PRIMARY KEY CHECK (id = 1),
                 heat_pool INTEGER DEFAULT {self.config.INITIAL_HEAT_POOL},
                 total_allocated_heat INTEGER DEFAULT 0,
-                version INTEGER DEFAULT 1
+                version INTEGER DEFAULT 1,
+                current_turn INTEGER DEFAULT {self.config.INITIAL_TURN}  -- 存储当前轮数
             )
         """)
         
-        # 创建操作日志表
+        # 创建操作日志表（使用轮数而非时间戳）
         self.cursor.execute(f"""
             CREATE TABLE IF NOT EXISTS {self.config.OPERATION_LOG_TABLE} (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -478,34 +635,38 @@ class MemoryModule:
                 cluster_id TEXT,
                 old_value TEXT,
                 new_value TEXT,
-                timestamp REAL,
+                turn INTEGER DEFAULT 0,  -- 操作发生的轮数
                 applied INTEGER DEFAULT 0,
                 retry_count INTEGER DEFAULT 0
             )
         """)
         
         # 创建索引
-        self.cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_op_log_timestamp ON {self.config.OPERATION_LOG_TABLE}(timestamp)")
+        self.cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_op_log_turn ON {self.config.OPERATION_LOG_TABLE}(turn)")
         self.cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_op_log_applied ON {self.config.OPERATION_LOG_TABLE}(applied)")
         self.cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_memory_cluster ON {self.config.MEMORY_TABLE}(cluster_id, heat)")
         self.cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_memory_hot_heat ON {self.config.MEMORY_TABLE}(is_hot, heat DESC)")
+        self.cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_memory_turn ON {self.config.MEMORY_TABLE}(last_interaction_turn DESC)")
         
         # 初始化表
         self.cursor.execute(f"""
-            INSERT OR IGNORE INTO {self.config.HEAT_POOL_TABLE} (id, heat_pool, total_allocated_heat)
-            VALUES (1, {self.config.INITIAL_HEAT_POOL}, 0)
+            INSERT OR IGNORE INTO {self.config.HEAT_POOL_TABLE} 
+            (id, heat_pool, total_allocated_heat, current_turn)
+            VALUES (1, {self.config.INITIAL_HEAT_POOL}, 0, {self.config.INITIAL_TURN})
         """)
         
         self.conn.commit()
     
     def _load_system_state(self):
-        """加载系统状态"""
-        # 加载热力池
-        self.cursor.execute(f"SELECT heat_pool, total_allocated_heat FROM {self.config.HEAT_POOL_TABLE} WHERE id = 1")
+        """加载系统状态（包括当前轮数）"""
+        # 加载热力池和当前轮数
+        self.cursor.execute(f"SELECT heat_pool, total_allocated_heat, current_turn FROM {self.config.HEAT_POOL_TABLE} WHERE id = 1")
         row = self.cursor.fetchone()
         if row:
             self.heat_pool = row['heat_pool']
             self.total_allocated_heat = row['total_allocated_heat']
+            self.current_turn = row['current_turn']
+            self.stats['current_turn'] = self.current_turn
         
         # 加载所有簇
         self._load_all_clusters()
@@ -513,8 +674,13 @@ class MemoryModule:
         # 加载热区记忆
         self._load_hot_memories()
         
+        # 加载访问频率统计
+        self._load_access_frequency_stats()
+        
         # 初始一致性检查
         self._check_consistency()
+        
+        print(f"System state loaded. Current turn: {self.current_turn}")
     
     def _load_all_clusters(self):
         """加载所有语义簇"""
@@ -530,7 +696,7 @@ class MemoryModule:
                 cold_memory_count=row['cold_memory_count'],
                 is_loaded=bool(row['is_loaded']),
                 size=row['size'],
-                last_updated=row['last_updated'],
+                last_updated_turn=row['last_updated_turn'],
                 version=row['version'],
                 pending_heat_delta=row['pending_heat_delta'],
                 memory_additions_since_last_update=row['memory_additions_since_last_update'] or 0
@@ -556,14 +722,15 @@ class MemoryModule:
                 vector=self._blob_to_vector(row['vector']),
                 content=row['content'],
                 heat=row['heat'],
-                last_accessed=row['last_accessed'],
+                created_turn=row['created_turn'],
+                last_interaction_turn=row['last_interaction_turn'],
                 access_count=row['access_count'],
                 is_hot=bool(row['is_hot']),
                 is_sleeping=bool(row['is_sleeping']),
                 cluster_id=row['cluster_id'],
-                created_at=row['created_at'],
                 metadata=json.loads(row['metadata']) if row['metadata'] else {},
-                version=row['version']
+                version=row['version'],
+                update_count=row['update_count'] or 0
             )
             
             self.hot_memories[memory.id] = memory
@@ -577,6 +744,19 @@ class MemoryModule:
                     cluster.is_loaded = True
         
         print(f"Loaded {len(self.hot_memories)} hot memories from database")
+    
+    def _load_access_frequency_stats(self):
+        """加载访问频率统计"""
+        try:
+            # 从热区记忆加载访问频率统计
+            for memory_id, memory in self.hot_memories.items():
+                self.access_frequency_stats[memory_id] = {
+                    'count': memory.access_count,
+                    'last_reset_turn': memory.created_turn,  # 使用创建轮数作为重置点
+                    'recent_interactions': []  # 用于跟踪最近交互的轮数
+                }
+        except Exception as e:
+            print(f"Warning: Failed to load access frequency stats: {e}")
     
     def _check_consistency(self):
         """检查系统一致性"""
@@ -611,6 +791,7 @@ class MemoryModule:
             self._repair_consistency()
         
         print(f"Heat consistency check: Memories={total_heat_in_memories}, Clusters={total_heat_in_clusters}, Pool={self.heat_pool}")
+        print(f"Current turn: {self.current_turn}")
     
     def _repair_consistency(self):
         """修复一致性"""
@@ -655,7 +836,7 @@ class MemoryModule:
             self.operation_log.append({
                 'transaction_id': transaction_id,
                 'type': 'begin',
-                'timestamp': time.time()
+                'turn': self.current_turn
             })
             return True
         except sqlite3.OperationalError as e:
@@ -673,14 +854,14 @@ class MemoryModule:
                 self.operation_log.append({
                     'transaction_id': transaction_id,
                     'type': 'commit',
-                    'timestamp': time.time()
+                    'turn': self.current_turn
                 })
             else:
                 self.conn.rollback()
                 self.operation_log.append({
                     'transaction_id': transaction_id,
                     'type': 'rollback',
-                    'timestamp': time.time()
+                    'turn': self.current_turn
                 })
             return True
         except Exception as e:
@@ -701,6 +882,9 @@ class MemoryModule:
             self.stats['events_triggered'] += 1
         
         if need_maintenance:
+            # 增加维护轮数
+            self._increment_turn(self.config.TURN_INCREMENT_ON_MAINTENANCE)
+            
             # 提交维护任务到线程池
             self.background_executor.submit(self._perform_maintenance_tasks)
             
@@ -712,7 +896,8 @@ class MemoryModule:
     
     def _perform_maintenance_tasks(self):
         """执行维护任务 - 完全事件驱动"""
-        print(f"\n[Memory System] Performing maintenance tasks")
+        current_turn = self.current_turn
+        print(f"\n[Memory System] Performing maintenance tasks (Turn: {current_turn})")
         print(f"  Operations since last: {self.operation_count}")
         print(f"  Memory additions since last: {self.memory_addition_count}")
         
@@ -731,20 +916,276 @@ class MemoryModule:
         # 4. 检查一致性
         self._check_consistency()
         
-        # 5. 检查是否需要创建检查点
+        # 5. 检查热力分布（新增）
+        self._check_and_adjust_heat_distribution()
+        
+        # 6. 检查是否需要创建检查点
         self._create_checkpoint_if_needed()
         
-        # 6. 检查并处理休眠记忆
+        # 7. 检查并处理休眠记忆
         if len(self.sleeping_memories) > 0:
             self._check_and_move_sleeping()
         
-        # 7. 更新内存缓存状态
+        # 8. 更新内存缓存状态
         self._update_memory_cache_state()
+        
+        # 9. 清理过期的访问频率统计
+        self._cleanup_access_frequency_stats()
+        
+        # 10. 清理簇热力历史记录
+        self._cleanup_cluster_heat_history()
         
         elapsed = time.time() - start_time
         self.stats['maintenance_cycles'] += 1
         
         print(f"[Memory System] Maintenance cycle {self.stats['maintenance_cycles']} completed in {elapsed:.2f}s")
+    
+    def _check_and_adjust_heat_distribution(self):
+        """检查并调整热力分布，确保前3/5个簇的热力占比不超过阈值"""
+        # 每HEAT_RECYCLE_CHECK_FREQUENCY次维护检查一次
+        self.maintenance_cycles_since_heat_check += 1
+        if self.maintenance_cycles_since_heat_check < self.config.HEAT_RECYCLE_CHECK_FREQUENCY:
+            return
+        
+        self.maintenance_cycles_since_heat_check = 0
+        
+        print(f"[Heat Distribution] Checking cluster heat distribution (Turn: {self.current_turn})")
+        
+        # 收集所有簇的热力信息
+        cluster_heat_list = []
+        total_cluster_heat = 0
+        
+        for cluster_id, cluster in self.clusters.items():
+            if cluster.total_heat > 0:
+                cluster_heat_list.append({
+                    'cluster_id': cluster_id,
+                    'heat': cluster.total_heat,
+                    'size': cluster.size
+                })
+                total_cluster_heat += cluster.total_heat
+                
+                # 记录热力历史
+                if cluster_id not in self.cluster_heat_history:
+                    self.cluster_heat_history[cluster_id] = []
+                self.cluster_heat_history[cluster_id].append((self.current_turn, cluster.total_heat))
+        
+        if total_cluster_heat == 0 or len(cluster_heat_list) <= 5:
+            print(f"[Heat Distribution] Not enough clusters or total heat is zero")
+            return
+        
+        # 按热力降序排序
+        cluster_heat_list.sort(key=lambda x: x['heat'], reverse=True)
+        
+        # 计算前3和前5个簇的热力占比
+        top3_heat = sum(cluster['heat'] for cluster in cluster_heat_list[:3])
+        top5_heat = sum(cluster['heat'] for cluster in cluster_heat_list[:5])
+        
+        top3_ratio = top3_heat / total_cluster_heat
+        top5_ratio = top5_heat / total_cluster_heat
+        
+        print(f"[Heat Distribution] Top 3 clusters: {top3_ratio:.2%} (limit: {self.config.TOP3_HEAT_LIMIT_RATIO:.0%})")
+        print(f"[Heat Distribution] Top 5 clusters: {top5_ratio:.2%} (limit: {self.config.TOP5_HEAT_LIMIT_RATIO:.0%})")
+        
+        # 检查是否超过阈值
+        need_recycle = False
+        if top3_ratio > self.config.TOP3_HEAT_LIMIT_RATIO:
+            print(f"[Heat Distribution] Warning: Top 3 clusters exceed limit by {(top3_ratio - self.config.TOP3_HEAT_LIMIT_RATIO):.2%}")
+            need_recycle = True
+        
+        if top5_ratio > self.config.TOP5_HEAT_LIMIT_RATIO:
+            print(f"[Heat Distribution] Warning: Top 5 clusters exceed limit by {(top5_ratio - self.config.TOP5_HEAT_LIMIT_RATIO):.2%}")
+            need_recycle = True
+        
+        if not need_recycle:
+            print(f"[Heat Distribution] Heat distribution is within limits")
+            return
+        
+        # 执行热力回收
+        print(f"[Heat Distribution] Starting heat redistribution...")
+        self._redistribute_cluster_heat(cluster_heat_list, total_cluster_heat)
+        
+        # 记录回收轮数
+        self.last_heat_recycle_turn = self.current_turn
+        self.heat_recycle_count += 1
+        self.stats['heat_redistributions'] = self.stats.get('heat_redistributions', 0) + 1
+        
+        print(f"[Heat Distribution] Heat redistribution completed at turn {self.current_turn}")
+    
+    def _redistribute_cluster_heat(self, cluster_heat_list: List[Dict], total_cluster_heat: int):
+        """重新分配簇热力，回收超过限制的部分"""
+        # 计算每个簇的期望热力（基于其大小比例）
+        total_size = sum(cluster['size'] for cluster in cluster_heat_list)
+        if total_size == 0:
+            return
+        
+        # 线性均匀扣除：计算需要回收的总热力
+        excess_heat = 0
+        
+        # 计算前3簇的超额热力
+        top3_excess = max(0, sum(cluster['heat'] for cluster in cluster_heat_list[:3]) - 
+                         total_cluster_heat * self.config.TOP3_HEAT_LIMIT_RATIO)
+        
+        # 计算前5簇的超额热力
+        top5_excess = max(0, sum(cluster['heat'] for cluster in cluster_heat_list[:5]) - 
+                         total_cluster_heat * self.config.TOP5_HEAT_LIMIT_RATIO)
+        
+        excess_heat = max(top3_excess, top5_excess)
+        
+        if excess_heat <= 0:
+            return
+        
+        print(f"[Heat Distribution] Excess heat to recycle: {excess_heat}")
+        
+        # 计算每个簇应回收的热力（按当前热力比例）
+        total_top_heat = sum(cluster['heat'] for cluster in cluster_heat_list[:5])
+        if total_top_heat == 0:
+            return
+        
+        recycled_heat = 0
+        
+        with TransactionContext(self, ConsistencyLevel.STRONG) as tx:
+            # 从超额的簇中回收热力
+            for i, cluster_info in enumerate(cluster_heat_list[:5]):
+                cluster_id = cluster_info['cluster_id']
+                cluster = self.clusters.get(cluster_id)
+                if not cluster:
+                    continue
+                
+                # 计算该簇应回收的热力（按比例）
+                cluster_excess_ratio = cluster.total_heat / total_top_heat
+                cluster_excess_heat = int(excess_heat * cluster_excess_ratio * self.config.HEAT_RECYCLE_RATE)
+                
+                # 确保不会回收过多，保留最小热力
+                min_heat_for_cluster = max(self.config.MIN_CLUSTER_HEAT_AFTER_RECYCLE, 
+                                         cluster.size * 10)  # 每个记忆至少10热力
+                
+                if cluster.total_heat - cluster_excess_heat < min_heat_for_cluster:
+                    cluster_excess_heat = max(0, cluster.total_heat - min_heat_for_cluster)
+                
+                if cluster_excess_heat <= 0:
+                    continue
+                
+                print(f"[Heat Distribution] Recycling {cluster_excess_heat} heat from cluster {cluster_id}")
+                
+                # 从簇内记忆回收热力（均匀扣除）
+                memories_to_adjust = []
+                for memory_id in list(cluster.memory_ids):
+                    if memory_id in self.hot_memories:
+                        memories_to_adjust.append(self.hot_memories[memory_id])
+                
+                if not memories_to_adjust:
+                    continue
+                
+                # 计算每个记忆应扣除的热力
+                heat_per_memory = max(1, cluster_excess_heat // len(memories_to_adjust))
+                
+                for memory in memories_to_adjust:
+                    heat_to_deduct = min(heat_per_memory, memory.heat - 1)  # 至少保留1热力
+                    if heat_to_deduct <= 0:
+                        continue
+                    
+                    new_heat = memory.heat - heat_to_deduct
+                    tx.add_memory_heat_update(memory.id, memory.heat, new_heat, cluster_id)
+                    memory.heat = new_heat
+                    memory.update_count += 1
+                    
+                    # 更新数据库
+                    self.cursor.execute(f"""
+                        UPDATE {self.config.MEMORY_TABLE}
+                        SET heat = ?, update_count = update_count + 1
+                        WHERE id = ?
+                    """, (new_heat, memory.id))
+                    
+                    recycled_heat += heat_to_deduct
+                
+                # 更新簇总热力
+                cluster.total_heat -= cluster_excess_heat
+                tx.add_cluster_heat_update(cluster_id, -cluster_excess_heat)
+                
+                # 更新数据库中的簇热力
+                self.cursor.execute(f"""
+                    UPDATE {self.config.CLUSTER_TABLE}
+                    SET total_heat = ?
+                    WHERE id = ?
+                """, (cluster.total_heat, cluster_id))
+            
+            # 将回收的热力放回热力池
+            if recycled_heat > 0:
+                with self.heat_pool_lock:
+                    old_heat_pool = self.heat_pool
+                    self.heat_pool += recycled_heat
+                    
+                    # 更新数据库中的热力池
+                    self.cursor.execute(f"""
+                        UPDATE {self.config.HEAT_POOL_TABLE}
+                        SET heat_pool = ?
+                        WHERE id = 1
+                    """, (self.heat_pool,))
+                
+                print(f"[Heat Distribution] Recycled {recycled_heat} heat back to pool. "
+                      f"Pool: {old_heat_pool} -> {self.heat_pool}")
+                
+                self.stats['heat_recycled_to_pool'] = self.stats.get('heat_recycled_to_pool', 0) + recycled_heat
+        
+        # 清除相关缓存
+        for cluster_info in cluster_heat_list[:5]:
+            cluster_id = cluster_info['cluster_id']
+            self.cluster_search_cache.clear(cluster_id)
+    
+    def _is_in_suppression_period(self) -> bool:
+        """检查是否处于热力回收抑制期"""
+        if self.last_heat_recycle_turn == 0:
+            return False
+        
+        turns_since_recycle = self.current_turn - self.last_heat_recycle_turn
+        return turns_since_recycle < self.config.HEAT_RECYCLE_SUPPRESSION_TURNS
+    
+    def _get_suppression_factor(self) -> float:
+        """获取当前抑制系数"""
+        if not self._is_in_suppression_period():
+            return 1.0
+        
+        # 线性衰减：距离回收时间越近，抑制越强
+        turns_since_recycle = self.current_turn - self.last_heat_recycle_turn
+        remaining_suppression = max(0, self.config.HEAT_RECYCLE_SUPPRESSION_TURNS - turns_since_recycle)
+        
+        # 线性插值：从HEAT_SUPPRESSION_FACTOR到1.0
+        suppression_factor = self.config.HEAT_SUPPRESSION_FACTOR + (
+            (1.0 - self.config.HEAT_SUPPRESSION_FACTOR) * 
+            (1.0 - remaining_suppression / self.config.HEAT_RECYCLE_SUPPRESSION_TURNS)
+        )
+        
+        return min(1.0, max(self.config.HEAT_SUPPRESSION_FACTOR, suppression_factor))
+    
+    def _cleanup_access_frequency_stats(self):
+        """清理过期的访问频率统计"""
+        with self.frequency_stats_lock:
+            # 移除已经不存在的记忆的统计
+            memory_ids_to_remove = []
+            for memory_id in self.access_frequency_stats:
+                if memory_id not in self.hot_memories:
+                    memory_ids_to_remove.append(memory_id)
+            
+            for memory_id in memory_ids_to_remove:
+                del self.access_frequency_stats[memory_id]
+    
+    def _cleanup_cluster_heat_history(self):
+        """清理过期的簇热力历史记录"""
+        max_history_age = 1000  # 最多保存1000轮的历史记录
+        clusters_to_remove = []
+        
+        for cluster_id, history in self.cluster_heat_history.items():
+            # 移除过期的记录
+            fresh_history = [(turn, heat) for turn, heat in history 
+                           if self.current_turn - turn <= max_history_age]
+            
+            if fresh_history:
+                self.cluster_heat_history[cluster_id] = fresh_history
+            else:
+                clusters_to_remove.append(cluster_id)
+        
+        for cluster_id in clusters_to_remove:
+            del self.cluster_heat_history[cluster_id]
     
     def _flush_update_queue(self):
         """处理所有待处理更新"""
@@ -766,19 +1207,20 @@ class MemoryModule:
     
     def _create_checkpoint(self):
         """创建检查点"""
-        print(f"[Memory System] Creating system checkpoint")
+        print(f"[Memory System] Creating system checkpoint (Turn: {self.current_turn})")
         
         try:
             # 保存所有热区记忆
             for memory in self.hot_memories.values():
                 self.cursor.execute(f"""
                     UPDATE {self.config.MEMORY_TABLE}
-                    SET heat = ?, last_accessed = ?, access_count = ?, 
-                        is_hot = ?, is_sleeping = ?, version = version + 1
+                    SET heat = ?, last_interaction_turn = ?, access_count = ?, 
+                        is_hot = ?, is_sleeping = ?, version = version + 1,
+                        update_count = update_count + 1
                     WHERE id = ?
                 """, (
                     memory.heat,
-                    memory.last_accessed,
+                    memory.last_interaction_turn,
                     memory.access_count,
                     int(memory.is_hot),
                     int(memory.is_sleeping),
@@ -790,7 +1232,7 @@ class MemoryModule:
                 self.cursor.execute(f"""
                     UPDATE {self.config.CLUSTER_TABLE}
                     SET centroid = ?, total_heat = ?, hot_memory_count = ?, cold_memory_count = ?,
-                        size = ?, last_updated = ?, version = version + 1,
+                        size = ?, last_updated_turn = ?, version = version + 1,
                         memory_additions_since_last_update = ?
                     WHERE id = ?
                 """, (
@@ -799,18 +1241,19 @@ class MemoryModule:
                     cluster.hot_memory_count,
                     cluster.cold_memory_count,
                     cluster.size,
-                    time.time(),
+                    self.current_turn,
                     cluster.memory_additions_since_last_update,
                     cluster.id
                 ))
             
-            # 保存热力池
+            # 保存热力池和当前轮数
             with self.heat_pool_lock:
                 self.cursor.execute(f"""
                     UPDATE {self.config.HEAT_POOL_TABLE}
-                    SET heat_pool = ?, total_allocated_heat = ?, version = version + 1
+                    SET heat_pool = ?, total_allocated_heat = ?, version = version + 1,
+                        current_turn = ?
                     WHERE id = 1
-                """, (self.heat_pool, self.total_allocated_heat))
+                """, (self.heat_pool, self.total_allocated_heat, self.current_turn))
             
             self.conn.commit()
             
@@ -833,7 +1276,7 @@ class MemoryModule:
         self.operation_log.append({
             'transaction_id': transaction_id,
             'type': 'begin',
-            'timestamp': time.time()
+            'turn': self.current_turn
         })
     
     def _commit_transaction(self, transaction_id: str, operations: List[Dict]) -> bool:
@@ -852,7 +1295,7 @@ class MemoryModule:
             self.operation_log.append({
                 'transaction_id': transaction_id,
                 'type': 'commit',
-                'timestamp': time.time(),
+                'turn': self.current_turn,
                 'operation_count': len(operations)
             })
             
@@ -867,7 +1310,7 @@ class MemoryModule:
         self.operation_log.append({
             'transaction_id': transaction_id,
             'type': 'rollback',
-            'timestamp': time.time()
+            'turn': self.current_turn
         })
     
     def _validate_transaction(self, operations: List[Dict]) -> bool:
@@ -918,14 +1361,15 @@ class MemoryModule:
                 memory = self.hot_memories[memory_id]
                 memory.heat = new_heat
                 memory.version += 1
+                memory.update_count += 1
             
             # 更新数据库
             if immediate:
                 self.cursor.execute(f"""
                     UPDATE {self.config.MEMORY_TABLE}
-                    SET heat = ?, version = version + 1, last_updated = ?
+                    SET heat = ?, version = version + 1, update_count = update_count + 1
                     WHERE id = ?
-                """, (new_heat, time.time(), memory_id))
+                """, (new_heat, memory_id))
             
             # 更新簇热力（如果需要）
             if cluster_id and cluster_id in self.clusters:
@@ -963,7 +1407,7 @@ class MemoryModule:
         self.cursor.execute(f"""
             INSERT INTO {self.config.OPERATION_LOG_TABLE}
             (transaction_id, operation_type, memory_id, cluster_id, 
-             old_value, new_value, timestamp, applied)
+             old_value, new_value, turn, applied)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             operation.get('transaction_id'),
@@ -972,7 +1416,7 @@ class MemoryModule:
             operation.get('cluster_id'),
             json.dumps(operation.get('old_value', {})),
             json.dumps(operation.get('new_value', {})),
-            time.time(),
+            self.current_turn,
             int(applied)
         ))
     
@@ -996,7 +1440,7 @@ class MemoryModule:
                 'type': 'cluster_heat_update',
                 'cluster_id': cluster_id,
                 'heat_delta': heat_delta,
-                'timestamp': time.time()
+                'turn': self.current_turn
             })
     
     def _update_memory_and_cluster_heat_atomic(self, memory_id: str, new_heat: int, 
@@ -1036,7 +1480,7 @@ class MemoryModule:
             elif item['type'] == 'cluster_centroid_update':
                 cluster_centroid_updates[item['cluster_id']] = {
                     'centroid': item['centroid'],
-                    'timestamp': item['timestamp']
+                    'turn': item.get('turn', self.current_turn)
                 }
             elif item['type'] == 'memory_heat_update':
                 memory_updates[item['memory_id']] = item['new_heat']
@@ -1063,12 +1507,12 @@ class MemoryModule:
                 for cluster_id, update_data in cluster_centroid_updates.items():
                     self.cursor.execute(f"""
                         UPDATE {self.config.CLUSTER_TABLE}
-                        SET centroid = ?, last_updated = ?, version = version + 1,
+                        SET centroid = ?, last_updated_turn = ?, version = version + 1,
                             memory_additions_since_last_update = 0
                         WHERE id = ?
                     """, (
                         self._vector_to_blob(update_data['centroid']),
-                        update_data['timestamp'],
+                        update_data['turn'],
                         cluster_id
                     ))
         
@@ -1204,7 +1648,7 @@ class MemoryModule:
                     cluster.centroid = new_centroid
                     cluster.memory_additions_since_last_update = 0
                     cluster.pending_centroid_updates.clear()
-                    cluster.last_updated = time.time()
+                    cluster.last_updated_turn = self.current_turn
                     cluster.version += 1
                     
                     # 更新向量缓存
@@ -1213,7 +1657,7 @@ class MemoryModule:
                     # 记录更新
                     centroid_updates[cluster_id] = {
                         'centroid': new_centroid,
-                        'timestamp': time.time()
+                        'turn': self.current_turn
                     }
         
         # 批量更新数据库
@@ -1222,12 +1666,12 @@ class MemoryModule:
                 for cluster_id, update_data in centroid_updates.items():
                     self.cursor.execute(f"""
                         UPDATE {self.config.CLUSTER_TABLE}
-                        SET centroid = ?, last_updated = ?, version = version + 1,
+                        SET centroid = ?, last_updated_turn = ?, version = version + 1,
                             memory_additions_since_last_update = 0
                         WHERE id = ?
                     """, (
                         self._vector_to_blob(update_data['centroid']),
-                        update_data['timestamp'],
+                        update_data['turn'],
                         cluster_id
                     ))
             
@@ -1348,10 +1792,408 @@ class MemoryModule:
             return 0.0
         return float(np.dot(vec1, vec2) / (norm1 * norm2))
     
+    # =============== 访问频率和轮数相关方法 ===============
+    
+    def _update_access_frequency(self, memory_id: str):
+        """更新访问频率统计"""
+        with self.frequency_stats_lock:
+            if memory_id not in self.access_frequency_stats:
+                self.access_frequency_stats[memory_id] = {
+                    'count': 1,
+                    'last_reset_turn': self.current_turn,
+                    'recent_interactions': [self.current_turn]
+                }
+            else:
+                stats = self.access_frequency_stats[memory_id]
+                stats['count'] += 1
+                stats['recent_interactions'].append(self.current_turn)
+                
+                # 只保留最近100次交互记录（避免内存占用过多）
+                if len(stats['recent_interactions']) > 100:
+                    stats['recent_interactions'] = stats['recent_interactions'][-100:]
+                
+                # 检查是否需要重置统计（例如每1000轮重置一次）
+                if self.current_turn - stats['last_reset_turn'] > 1000:
+                    stats['count'] = 1
+                    stats['last_reset_turn'] = self.current_turn
+                    stats['recent_interactions'] = [self.current_turn]
+    
+    def _get_access_frequency_weight(self, memory_id: str, memory_item: MemoryItem) -> float:
+        """获取访问频率权重（过度访问会降低权重）"""
+        with self.frequency_stats_lock:
+            if memory_id not in self.access_frequency_stats:
+                return 1.0
+            
+            stats = self.access_frequency_stats[memory_id]
+            access_count = stats['count']
+            
+            # 计算基于轮数的访问频率（最近1000轮内的访问次数）
+            recent_interactions = [turn for turn in stats['recent_interactions'] 
+                                  if self.current_turn - turn < 1000]
+            recent_count = len(recent_interactions)
+            
+            # 使用最近访问次数和总访问次数综合判断
+            total_factor = min(1.0, self.config.ACCESS_FREQUENCY_DISCOUNT_THRESHOLD / max(1, access_count))
+            recent_factor = min(1.0, self.config.ACCESS_FREQUENCY_DISCOUNT_THRESHOLD / max(1, recent_count))
+            
+            # 综合权重（更关注最近访问频率）
+            weight = 0.3 * total_factor + 0.7 * recent_factor
+            
+            # 如果记忆被标记为休眠，进一步降低权重
+            if memory_item.is_sleeping:
+                weight *= 0.5
+            
+            return max(0.1, weight)  # 确保权重不低于0.1
+    
+    def _get_recency_weight(self, memory_item: MemoryItem) -> float:
+        """获取最近访问权重（基于轮数间隔）"""
+        # 计算距离上次交互的轮数间隔
+        turns_since_interaction = self.current_turn - memory_item.last_interaction_turn
+        
+        # 使用线性衰减计算权重（避免指数衰减的过度惩罚）
+        # 每轮衰减 config.RECENCY_WEIGHT_DECAY_PER_TURN
+        weight = 1.0 - (turns_since_interaction * self.config.RECENCY_WEIGHT_DECAY_PER_TURN)
+        
+        return max(0.1, min(1.0, weight))
+    
+    def _get_relative_heat_weight(self, memory_item: MemoryItem, cluster_total_heat: int) -> float:
+        """获取相对热力权重"""
+        if cluster_total_heat <= 0:
+            return 1.0
+        
+        # 计算相对热力比例
+        relative_heat = memory_item.heat / cluster_total_heat
+        
+        # 使用幂函数平滑权重分布（避免热力过高的记忆主导搜索结果）
+        # 当 RELATIVE_HEAT_WEIGHT_POWER < 1 时，会压缩高权重记忆的优势
+        weight = relative_heat ** self.config.RELATIVE_HEAT_WEIGHT_POWER
+        
+        # 添加最小权重保证
+        weight = max(0.1, min(1.0, weight))
+        
+        return weight
+    
+    # =============== 簇内搜索方法 ===============
+    
+    def search_within_cluster(self, query_text: str = None, query_vector: np.ndarray = None, 
+                             cluster_id: str = None, max_results: int = None) -> List[WeightedMemoryResult]:
+        """
+        在指定簇内搜索相似记忆，使用相对热力和访问频率加权
+        
+        参数:
+            query_text: 查询文本（如果提供，将计算其嵌入向量）
+            query_vector: 查询向量（如果提供，直接使用）
+            cluster_id: 要搜索的簇ID（如果为None，则在整个记忆库中搜索）
+            max_results: 最大返回结果数量
+        
+        返回:
+            WeightedMemoryResult列表，按最终得分排序
+        """
+        if max_results is None:
+            max_results = self.config.CLUSTER_SEARCH_MAX_RESULTS
+        
+        # 获取查询向量
+        if query_vector is None and query_text is not None:
+            query_vector = self._get_embedding(query_text)
+        elif query_vector is None:
+            raise ValueError("Either query_text or query_vector must be provided")
+        
+        # 如果未指定簇ID，使用最相似的簇
+        if cluster_id is None:
+            # 寻找最相似的簇
+            best_similarity = -1.0
+            for cid, centroid in self.cluster_vectors.items():
+                similarity = self._compute_similarity(query_vector, centroid)
+                if similarity > best_similarity:
+                    best_similarity = similarity
+                    cluster_id = cid
+        
+        if cluster_id not in self.clusters:
+            return []
+        
+        # 检查缓存
+        cached_results = self.cluster_search_cache.get(cluster_id, query_vector, self.current_turn)
+        if cached_results is not None:
+            self.stats['cache_hits'] += 1
+            # 返回不超过max_results的结果
+            return cached_results[:max_results]
+        
+        self.stats['cache_misses'] += 1
+        self.stats['cluster_searches'] += 1
+        
+        cluster = self.clusters[cluster_id]
+        cluster_total_heat = cluster.total_heat
+        
+        weighted_results = []
+        
+        # 获取簇内所有热区记忆
+        cluster_memory_ids = set()
+        
+        # 方法1：从簇的memory_ids中获取（可能不完整）
+        with cluster.lock:
+            cluster_memory_ids.update(cluster.memory_ids)
+        
+        # 方法2：从hot_memories中筛选属于该簇的记忆
+        for memory_id, memory in self.hot_memories.items():
+            if memory.cluster_id == cluster_id:
+                cluster_memory_ids.add(memory_id)
+        
+        # 计算加权得分
+        for memory_id in cluster_memory_ids:
+            memory = self.hot_memories.get(memory_id)
+            if memory is None or memory.is_sleeping:
+                # 如果记忆不在热区或是休眠状态，跳过
+                continue
+            
+            # 计算基础相似度
+            base_similarity = self._compute_similarity(query_vector, memory.vector)
+            
+            # 跳过相似度过低的记忆
+            if base_similarity < self.config.SIMILARITY_THRESHOLD:
+                continue
+            
+            # 计算各种权重
+            relative_heat_weight = self._get_relative_heat_weight(memory, cluster_total_heat)
+            access_frequency_weight = self._get_access_frequency_weight(memory_id, memory)
+            recency_weight = self._get_recency_weight(memory)
+            
+            # 计算最终得分（加权几何平均）
+            # 使用几何平均可以平衡各个权重的影响
+            weights = [relative_heat_weight, access_frequency_weight, recency_weight]
+            geometric_mean = np.exp(np.mean(np.log([max(0.0001, w) for w in weights])))
+            
+            final_score = base_similarity * geometric_mean
+            
+            # 创建加权结果对象
+            result = WeightedMemoryResult(
+                memory=memory,
+                base_similarity=base_similarity,
+                relative_heat_weight=relative_heat_weight,
+                access_frequency_weight=access_frequency_weight,
+                recency_weight=recency_weight,
+                final_score=final_score,
+                ranking_position=0  # 稍后设置
+            )
+            
+            weighted_results.append(result)
+        
+        # 按最终得分排序
+        weighted_results.sort(key=lambda x: x.final_score, reverse=True)
+        
+        # 设置排名位置并限制结果数量
+        for i, result in enumerate(weighted_results[:max_results]):
+            result.ranking_position = i + 1
+        
+        final_results = weighted_results[:max_results]
+        
+        # 更新统计信息
+        self.stats['weight_adjustments'] += len(final_results)
+        
+        # 检查是否有高频访问记忆
+        high_freq_count = sum(1 for r in final_results 
+                             if r.access_frequency_weight < 0.5)
+        self.stats['high_frequency_memories'] += high_freq_count
+        
+        # 缓存结果（仅当结果非空时）
+        if final_results:
+            self.cluster_search_cache.put(cluster_id, query_vector, final_results, self.current_turn)
+        
+        return final_results
+    
+    def search_similar_memories(self, query_text: str = None, query_vector: np.ndarray = None,
+                               max_results: int = 10, use_weighting: bool = True) -> List[WeightedMemoryResult]:
+        """
+        搜索相似记忆（跨所有簇），可选择是否使用加权
+        
+        参数:
+            query_text: 查询文本
+            query_vector: 查询向量
+            max_results: 最大返回结果数量
+            use_weighting: 是否使用热力/频率加权
+        
+        返回:
+            WeightedMemoryResult列表
+        """
+        if query_vector is None and query_text is not None:
+            query_vector = self._get_embedding(query_text)
+        elif query_vector is None:
+            raise ValueError("Either query_text or query_vector must be provided")
+        
+        all_results = []
+        
+        if use_weighting:
+            # 使用加权搜索：首先在每个簇内搜索，然后合并结果
+            for cluster_id in self.clusters.keys():
+                cluster_results = self.search_within_cluster(
+                    query_vector=query_vector,
+                    cluster_id=cluster_id,
+                    max_results=max_results // 2  # 从每个簇获取部分结果
+                )
+                all_results.extend(cluster_results)
+        else:
+            # 不使用加权：在整个记忆库中搜索
+            for memory_id, memory in self.hot_memories.items():
+                if memory.is_sleeping:
+                    continue
+                
+                similarity = self._compute_similarity(query_vector, memory.vector)
+                
+                if similarity >= self.config.SIMILARITY_THRESHOLD:
+                    result = WeightedMemoryResult(
+                        memory=memory,
+                        base_similarity=similarity,
+                        relative_heat_weight=1.0,
+                        access_frequency_weight=1.0,
+                        recency_weight=1.0,
+                        final_score=similarity,
+                        ranking_position=0
+                    )
+                    all_results.append(result)
+        
+        # 排序并限制结果数量
+        all_results.sort(key=lambda x: x.final_score, reverse=True)
+        
+        for i, result in enumerate(all_results[:max_results]):
+            result.ranking_position = i + 1
+        
+        return all_results[:max_results]
+    
+    def get_cluster_statistics(self, cluster_id: str) -> Dict[str, Any]:
+        """获取簇的统计信息，包括热力分布、访问频率等"""
+        if cluster_id not in self.clusters:
+            return {}
+        
+        cluster = self.clusters[cluster_id]
+        memories_in_cluster = []
+        
+        # 收集簇内记忆
+        for memory_id, memory in self.hot_memories.items():
+            if memory.cluster_id == cluster_id and not memory.is_sleeping:
+                memories_in_cluster.append(memory)
+        
+        if not memories_in_cluster:
+            return {
+                'cluster_id': cluster_id,
+                'total_heat': cluster.total_heat,
+                'memory_count': 0,
+                'heat_distribution': [],
+                'frequency_stats': [],
+                'current_turn': self.current_turn
+            }
+        
+        # 计算热力分布
+        heat_values = [m.heat for m in memories_in_cluster]
+        total_heat = sum(heat_values)
+        
+        heat_distribution = []
+        for memory in memories_in_cluster:
+            if total_heat > 0:
+                relative_heat = memory.heat / total_heat
+            else:
+                relative_heat = 0.0
+            
+            # 获取访问频率权重
+            access_weight = self._get_access_frequency_weight(memory.id, memory)
+            
+            heat_distribution.append({
+                'memory_id': memory.id,
+                'heat': memory.heat,
+                'relative_heat': relative_heat,
+                'access_count': memory.access_count,
+                'access_frequency_weight': access_weight,
+                'last_interaction_turn': memory.last_interaction_turn,
+                'turns_since_interaction': self.current_turn - memory.last_interaction_turn
+            })
+        
+        # 按热力排序
+        heat_distribution.sort(key=lambda x: x['heat'], reverse=True)
+        
+        # 计算访问频率统计
+        frequency_stats = []
+        for memory in memories_in_cluster:
+            stats = self.access_frequency_stats.get(memory.id, {})
+            frequency_stats.append({
+                'memory_id': memory.id,
+                'total_accesses': stats.get('count', memory.access_count),
+                'recent_accesses': len(stats.get('recent_interactions', [])),
+                'last_reset_turn': stats.get('last_reset_turn', memory.created_turn)
+            })
+        
+        return {
+            'cluster_id': cluster_id,
+            'total_heat': cluster.total_heat,
+            'memory_count': len(memories_in_cluster),
+            'heat_distribution': heat_distribution[:10],  # 只返回前10个
+            'frequency_stats': frequency_stats[:10],
+            'average_heat': total_heat / len(memories_in_cluster) if memories_in_cluster else 0,
+            'heat_std_dev': np.std(heat_values) if len(heat_values) > 1 else 0,
+            'current_turn': self.current_turn,
+            'cluster_last_updated_turn': cluster.last_updated_turn,
+            'turns_since_cluster_update': self.current_turn - cluster.last_updated_turn
+        }
+    
+    def reset_access_frequency(self, memory_id: str = None):
+        """重置访问频率统计"""
+        with self.frequency_stats_lock:
+            if memory_id:
+                if memory_id in self.access_frequency_stats:
+                    self.access_frequency_stats[memory_id] = {
+                        'count': 1,
+                        'last_reset_turn': self.current_turn,
+                        'recent_interactions': [self.current_turn]
+                    }
+            else:
+                # 重置所有记忆的访问频率
+                for mid in list(self.access_frequency_stats.keys()):
+                    self.access_frequency_stats[mid] = {
+                        'count': 1,
+                        'last_reset_turn': self.current_turn,
+                        'recent_interactions': [self.current_turn]
+                    }
+    
+    def adjust_memory_weights(self, memory_id: str, 
+                             heat_adjustment: float = 1.0,
+                             frequency_adjustment: float = 1.0):
+        """手动调整记忆权重（用于特殊情况）"""
+        if memory_id not in self.hot_memories:
+            return False
+        
+        memory = self.hot_memories[memory_id]
+        
+        # 调整热力
+        if heat_adjustment != 1.0:
+            new_heat = int(memory.heat * heat_adjustment)
+            with TransactionContext(self, ConsistencyLevel.STRONG) as tx:
+                tx.add_memory_heat_update(
+                    memory_id,
+                    memory.heat,
+                    new_heat,
+                    memory.cluster_id
+                )
+                memory.heat = new_heat
+        
+        # 调整访问频率权重（通过修改统计信息）
+        if frequency_adjustment != 1.0:
+            with self.frequency_stats_lock:
+                if memory_id in self.access_frequency_stats:
+                    stats = self.access_frequency_stats[memory_id]
+                    # 通过调整访问计数来间接影响权重
+                    adjusted_count = int(stats['count'] * frequency_adjustment)
+                    stats['count'] = max(1, adjusted_count)
+        
+        # 清除相关缓存
+        if memory.cluster_id:
+            self.cluster_search_cache.clear(memory.cluster_id)
+        
+        return True
+    
     # =============== 公共API ===============
     
     def add_memory(self, content: str, metadata: Dict[str, Any] = None) -> str:
         """添加新记忆（原子操作），包含重复检测"""
+        # 增加轮数
+        current_turn = self._increment_turn(self.config.TURN_INCREMENT_ON_ADD)
+        
         # 计算嵌入
         vector = self._get_embedding(content)
         
@@ -1362,16 +2204,24 @@ class MemoryModule:
             with TransactionContext(self, ConsistencyLevel.STRONG) as tx:
                 memory = self.hot_memories.get(duplicate_id)
                 if memory:
-                    # 更新访问记录
-                    memory.last_accessed = time.time()
+                    # 更新访问记录（使用轮数）
+                    memory.last_interaction_turn = current_turn
                     memory.access_count += 1
+                    memory.update_count += 1
+                    
+                    # 更新访问频率统计
+                    self._update_access_frequency(duplicate_id)
+                    
+                    # 清除相关缓存
+                    if memory.cluster_id:
+                        self.cluster_search_cache.clear(memory.cluster_id)
                     
                     # 更新数据库
                     self.cursor.execute(f"""
                         UPDATE {self.config.MEMORY_TABLE}
-                        SET last_accessed = ?, access_count = ?
+                        SET last_interaction_turn = ?, access_count = ?, update_count = update_count + 1
                         WHERE id = ?
-                    """, (memory.last_accessed, memory.access_count, duplicate_id))
+                    """, (memory.last_interaction_turn, memory.access_count, duplicate_id))
                     
                     # 更新统计
                     self.operation_count += 1
@@ -1390,9 +2240,9 @@ class MemoryModule:
                 # 只是更新访问记录
                 self.cursor.execute(f"""
                     UPDATE {self.config.MEMORY_TABLE}
-                    SET last_accessed = ?, access_count = access_count + 1
+                    SET last_interaction_turn = ?, access_count = access_count + 1, update_count = update_count + 1
                     WHERE id = ?
-                """, (time.time(), duplicate_id))
+                """, (current_turn, duplicate_id))
                 self.duplicate_skipped_count += 1
                 return duplicate_id
         
@@ -1403,19 +2253,29 @@ class MemoryModule:
                 self._recycle_heat_pool()
             
             # 生成记忆ID
-            memory_id = hashlib.md5(f"{content}_{time.time()}".encode()).hexdigest()[:16]
+            memory_id = hashlib.md5(f"{content}_{current_turn}".encode()).hexdigest()[:16]
             
-            # 创建记忆
+            # 创建记忆（使用轮数）
             memory = MemoryItem(
                 id=memory_id,
                 vector=vector,
                 content=content,
                 heat=0,
+                created_turn=current_turn,
+                last_interaction_turn=current_turn,
                 metadata=metadata or {}
             )
             
-            # 分配热力（原子操作）
-            allocated_heat = min(self.config.NEW_MEMORY_HEAT, self.heat_pool)
+            # 分配热力（应用抑制系数）
+            base_allocated_heat = min(self.config.NEW_MEMORY_HEAT, self.heat_pool)
+            suppression_factor = self._get_suppression_factor()
+            
+            if suppression_factor < 1.0:
+                print(f"[Heat Suppression] Applying suppression factor {suppression_factor:.2f} to new memory")
+                allocated_heat = int(base_allocated_heat * suppression_factor)
+            else:
+                allocated_heat = base_allocated_heat
+            
             with self.heat_pool_lock:
                 self.heat_pool -= allocated_heat
             
@@ -1423,23 +2283,26 @@ class MemoryModule:
             neighbors = self._find_neighbors(vector, exclude_id=memory_id)
             
             if neighbors:
-                # 分配热力给邻居
-                similarities = [sim for _, sim, _ in neighbors]
-                allocations = self._exponential_allocation(similarities, allocated_heat // 2)
+                # 应用抑制系数到邻居的热力分配
+                neighbor_count = len(neighbors)
+                if suppression_factor < 1.0:
+                    allocation_per_neighbor = int((allocated_heat // (neighbor_count + 1)) * suppression_factor)
+                else:
+                    allocation_per_neighbor = allocated_heat // (neighbor_count + 1)
                 
                 total_allocated = 0
-                for (neighbor_id, _, neighbor_memory), allocation in zip(neighbors, allocations):
-                    new_heat = neighbor_memory.heat + allocation
+                for (neighbor_id, _, neighbor_memory) in neighbors:
+                    new_heat = neighbor_memory.heat + allocation_per_neighbor
                     tx.add_memory_heat_update(
                         neighbor_id, 
                         neighbor_memory.heat, 
                         new_heat,
                         neighbor_memory.cluster_id
                     )
-                    total_allocated += allocation
+                    total_allocated += allocation_per_neighbor
                 
-                # 剩余热力给新记忆
-                memory.heat = allocated_heat - total_allocated
+                # 新记忆获得相同的热力
+                memory.heat = allocation_per_neighbor
             else:
                 memory.heat = allocated_heat
             
@@ -1453,12 +2316,17 @@ class MemoryModule:
             self.hot_memories[memory_id] = memory
             self.memory_to_cluster[memory_id] = cluster_id
             
+            # 初始化访问频率统计
+            self._update_access_frequency(memory_id)
+            
             # 记录记忆创建操作
             tx.add_memory_heat_update(memory_id, 0, memory.heat, cluster_id)
             
             # 更新统计
             self.stats['hot_memories'] += 1
             self.stats['total_memories'] += 1
+            if suppression_factor < 1.0:
+                self.stats['suppressed_memory_additions'] = self.stats.get('suppressed_memory_additions', 0) + 1
             
             # 更新事件计数器
             self.memory_addition_count += 1
@@ -1470,20 +2338,20 @@ class MemoryModule:
             # 保存到数据库
             self.cursor.execute(f"""
                 INSERT INTO {self.config.MEMORY_TABLE} 
-                (id, vector, content, heat, last_accessed, access_count, 
-                 is_hot, is_sleeping, cluster_id, created_at, metadata)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (id, vector, content, heat, created_turn, last_interaction_turn, 
+                 access_count, is_hot, is_sleeping, cluster_id, metadata, update_count)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
             """, (
                 memory.id,
                 self._vector_to_blob(memory.vector),
                 memory.content,
                 memory.heat,
-                memory.last_accessed,
+                memory.created_turn,
+                memory.last_interaction_turn,
                 memory.access_count,
                 int(memory.is_hot),
                 int(memory.is_sleeping),
                 memory.cluster_id,
-                memory.created_at,
                 json.dumps(memory.metadata)
             ))
             
@@ -1491,11 +2359,22 @@ class MemoryModule:
     
     def access_memory(self, memory_id: str) -> Optional[MemoryItem]:
         """访问记忆"""
+        # 增加轮数
+        current_turn = self._increment_turn(self.config.TURN_INCREMENT_ON_ACCESS)
+        
         # 在热区查找
         if memory_id in self.hot_memories:
             memory = self.hot_memories[memory_id]
-            memory.last_accessed = time.time()
+            memory.last_interaction_turn = current_turn
             memory.access_count += 1
+            memory.update_count += 1
+            
+            # 更新访问频率统计
+            self._update_access_frequency(memory_id)
+            
+            # 清除相关缓存（因为记忆状态已改变）
+            if memory.cluster_id:
+                self.cluster_search_cache.clear(memory.cluster_id)
             
             # 更新事件计数器
             self.operation_count += 1
@@ -1506,9 +2385,9 @@ class MemoryModule:
             # 更新数据库
             self.cursor.execute(f"""
                 UPDATE {self.config.MEMORY_TABLE}
-                SET last_accessed = ?, access_count = ?
+                SET last_interaction_turn = ?, access_count = ?, update_count = update_count + 1
                 WHERE id = ?
-            """, (memory.last_accessed, memory.access_count, memory_id))
+            """, (memory.last_interaction_turn, memory.access_count, memory_id))
             
             return memory
         
@@ -1536,17 +2415,23 @@ class MemoryModule:
                     vector=self._blob_to_vector(row['vector']),
                     content=row['content'],
                     heat=self.config.INITIAL_HEAT_FOR_FROZEN,
-                    last_accessed=time.time(),
+                    created_turn=row['created_turn'],
+                    last_interaction_turn=current_turn,
                     access_count=row['access_count'] + 1,
                     is_hot=True,
+                    is_sleeping=False,
                     cluster_id=row['cluster_id'],
-                    created_at=row['created_at'],
-                    metadata=json.loads(row['metadata']) if row['metadata'] else {}
+                    metadata=json.loads(row['metadata']) if row['metadata'] else {},
+                    version=row['version'],
+                    update_count=(row['update_count'] or 0) + 1
                 )
                 
                 # 添加到热区
                 self.hot_memories[memory_id] = memory
                 self.memory_to_cluster[memory_id] = memory.cluster_id
+                
+                # 初始化访问频率统计
+                self._update_access_frequency(memory_id)
                 
                 # 调度簇质心更新（记忆从冷区回到热区）
                 if memory.cluster_id:
@@ -1563,16 +2448,19 @@ class MemoryModule:
                 # 更新数据库
                 self.cursor.execute(f"""
                     UPDATE {self.config.MEMORY_TABLE}
-                    SET is_hot = 1, heat = ?, last_accessed = ?, access_count = ?
+                    SET is_hot = 1, is_sleeping = 0, heat = ?, 
+                        last_interaction_turn = ?, access_count = ?, update_count = ?
                     WHERE id = ?
-                """, (memory.heat, memory.last_accessed, memory.access_count, memory_id))
+                """, (memory.heat, memory.last_interaction_turn, memory.access_count, 
+                      memory.update_count, memory_id))
                 
                 # 更新簇
                 if memory.cluster_id and memory.cluster_id in self.clusters:
                     cluster = self.clusters[memory.cluster_id]
-                    cluster.hot_memory_count += 1
-                    cluster.cold_memory_count -= 1
-                    cluster.total_heat += memory.heat
+                    with cluster.lock:
+                        cluster.hot_memory_count += 1
+                        cluster.cold_memory_count -= 1
+                        cluster.total_heat += memory.heat
                     
                     # 记录簇更新
                     tx.add_cluster_heat_update(memory.cluster_id, memory.heat)
@@ -1587,6 +2475,9 @@ class MemoryModule:
     
     def _recycle_heat_pool(self):
         """回收热力到热力池（原子操作）"""
+        # 增加轮数
+        self._increment_turn()
+        
         with TransactionContext(self, ConsistencyLevel.STRONG) as tx:
             target_recycle = int(self.config.TOTAL_HEAT * 0.05)
             current_need = target_recycle - self.heat_pool
@@ -1613,6 +2504,7 @@ class MemoryModule:
                     tx.add_memory_heat_update(memory_id, memory.heat, new_heat, memory.cluster_id)
                     
                     memory.heat = new_heat
+                    memory.update_count += 1
                     total_recycled += deduct_per_memory
                 else:
                     tx.add_memory_heat_update(memory_id, memory.heat, 0, memory.cluster_id)
@@ -1620,6 +2512,7 @@ class MemoryModule:
                     total_recycled += memory.heat
                     memory.heat = 0
                     memory.is_sleeping = True
+                    memory.update_count += 1
                     self.sleeping_memories[memory_id] = memory
             
             # 更新热力池
@@ -1633,6 +2526,7 @@ class MemoryModule:
             self._trigger_maintenance_if_needed()
             
             self.stats['total_heat_recycled'] += total_recycled
+            self.stats['last_recycle_turn'] = self.current_turn
             
             # 检查休眠记忆
             if len(self.sleeping_memories) > 0:
@@ -1658,25 +2552,22 @@ class MemoryModule:
         return neighbors[:limit]
     
     def _exponential_allocation(self, similarities: List[float], total_heat: int) -> List[int]:
-        """指数函数分配热力"""
+        """指数函数分配热力（已弃用，改为平分）"""
         if not similarities:
             return []
         
-        weights = [self.config.EXPONENT_BASE ** (sim * 10) for sim in similarities]
-        total_weight = sum(weights)
-        
-        min_weight = total_weight * self.config.MIN_ALLOCATION_RATIO
-        weights = [max(w, min_weight) for w in weights]
-        total_weight = sum(weights)
+        # 现在改为简单的平分
+        neighbor_count = len(similarities)
+        allocation_per_neighbor = total_heat // neighbor_count
         
         allocations = []
         total_allocated = 0
         
-        for i, weight in enumerate(weights):
-            if i == len(weights) - 1:
+        for i in range(neighbor_count):
+            if i == neighbor_count - 1:
                 allocation = total_heat - total_allocated
             else:
-                allocation = int(total_heat * weight / total_weight)
+                allocation = allocation_per_neighbor
                 total_allocated += allocation
             
             allocations.append(allocation)
@@ -1699,7 +2590,7 @@ class MemoryModule:
             cluster_id = best_cluster_id
         else:
             # 创建新簇
-            cluster_id = f"cluster_{int(time.time())}_{hashlib.md5(vector.tobytes()).hexdigest()[:8]}"
+            cluster_id = f"cluster_{self.current_turn}_{hashlib.md5(vector.tobytes()).hexdigest()[:8]}"
             cluster = SemanticCluster(
                 id=cluster_id,
                 centroid=vector.copy(),
@@ -1708,7 +2599,7 @@ class MemoryModule:
                 cold_memory_count=0,
                 is_loaded=True,
                 size=0,
-                last_updated=time.time(),
+                last_updated_turn=self.current_turn,
                 memory_additions_since_last_update=0
             )
             
@@ -1722,7 +2613,7 @@ class MemoryModule:
             self.cursor.execute(f"""
                 INSERT INTO {self.config.CLUSTER_TABLE} 
                 (id, centroid, total_heat, hot_memory_count, cold_memory_count, 
-                 is_loaded, size, last_updated, memory_additions_since_last_update)
+                 is_loaded, size, last_updated_turn, memory_additions_since_last_update)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 cluster.id,
@@ -1732,7 +2623,7 @@ class MemoryModule:
                 cluster.cold_memory_count,
                 int(cluster.is_loaded),
                 cluster.size,
-                cluster.last_updated,
+                cluster.last_updated_turn,
                 cluster.memory_additions_since_last_update
             ))
         
@@ -1752,13 +2643,14 @@ class MemoryModule:
         if len(self.sleeping_memories) == 0:
             return
         
-        print(f"[Memory System] Moving {len(self.sleeping_memories)} sleeping memories to cold zone")
+        print(f"[Memory System] Moving {len(self.sleeping_memories)} sleeping memories to cold zone (Turn: {self.current_turn})")
         
         with TransactionContext(self, ConsistencyLevel.STRONG) as tx:
             for memory_id, memory in list(self.sleeping_memories.items()):
                 # 移动到冷区
                 memory.is_hot = False
                 memory.is_sleeping = False
+                memory.update_count += 1
                 
                 # 调度簇质心更新（记忆从热区移除）
                 if memory.cluster_id:
@@ -1767,7 +2659,7 @@ class MemoryModule:
                 # 更新数据库
                 self.cursor.execute(f"""
                     UPDATE {self.config.MEMORY_TABLE}
-                    SET is_hot = 0, is_sleeping = 0, heat = 0
+                    SET is_hot = 0, is_sleeping = 0, heat = 0, update_count = update_count + 1
                     WHERE id = ?
                 """, (memory_id,))
                 
@@ -1785,6 +2677,11 @@ class MemoryModule:
                 # 从热区移除
                 del self.hot_memories[memory_id]
                 del self.sleeping_memories[memory_id]
+                
+                # 从访问频率统计中移除
+                with self.frequency_stats_lock:
+                    if memory_id in self.access_frequency_stats:
+                        del self.access_frequency_stats[memory_id]
                 
                 # 更新统计
                 self.stats['hot_memories'] -= 1
@@ -1804,7 +2701,7 @@ class MemoryModule:
             UPDATE {self.config.CLUSTER_TABLE}
             SET centroid = ?, total_heat = ?, hot_memory_count = ?, 
                 cold_memory_count = ?, is_loaded = ?, size = ?, 
-                last_updated = ?, version = version + 1,
+                last_updated_turn = ?, version = version + 1,
                 memory_additions_since_last_update = ?
             WHERE id = ?
         """, (
@@ -1814,7 +2711,7 @@ class MemoryModule:
             cluster.cold_memory_count,
             int(cluster.is_loaded),
             cluster.size,
-            time.time(),
+            self.current_turn,
             cluster.memory_additions_since_last_update,
             cluster.id
         ))
@@ -1823,6 +2720,41 @@ class MemoryModule:
     def get_stats(self) -> Dict[str, Any]:
         """获取系统统计信息"""
         stats = self.stats.copy()
+        
+        # 新增热力分布统计
+        cluster_heat_list = []
+        total_cluster_heat = 0
+        
+        for cluster_id, cluster in self.clusters.items():
+            if cluster.total_heat > 0:
+                cluster_heat_list.append({
+                    'cluster_id': cluster_id,
+                    'heat': cluster.total_heat,
+                    'size': cluster.size
+                })
+                total_cluster_heat += cluster.total_heat
+        
+        if cluster_heat_list:
+            cluster_heat_list.sort(key=lambda x: x['heat'], reverse=True)
+            
+            top3_heat = sum(cluster['heat'] for cluster in cluster_heat_list[:min(3, len(cluster_heat_list))])
+            top5_heat = sum(cluster['heat'] for cluster in cluster_heat_list[:min(5, len(cluster_heat_list))])
+            
+            top3_ratio = top3_heat / total_cluster_heat if total_cluster_heat > 0 else 0
+            top5_ratio = top5_heat / total_cluster_heat if total_cluster_heat > 0 else 0
+            
+            stats.update({
+                'top3_heat_ratio': top3_ratio,
+                'top5_heat_ratio': top5_ratio,
+                'top3_exceeds_limit': top3_ratio > self.config.TOP3_HEAT_LIMIT_RATIO,
+                'top5_exceeds_limit': top5_ratio > self.config.TOP5_HEAT_LIMIT_RATIO,
+                'in_suppression_period': self._is_in_suppression_period(),
+                'suppression_factor': self._get_suppression_factor(),
+                'turns_since_last_recycle': self.current_turn - self.last_heat_recycle_turn if self.last_heat_recycle_turn > 0 else None,
+                'heat_recycle_count': self.heat_recycle_count,
+                'cluster_heat_history_size': sum(len(history) for history in self.cluster_heat_history.values()),
+            })
+        
         stats.update({
             'memory_addition_count': self.memory_addition_count,
             'operation_count': self.operation_count,
@@ -1838,12 +2770,32 @@ class MemoryModule:
             'duplicate_detection_enabled': self.config.DUPLICATE_CHECK_ENABLED,
             'duplicate_threshold': self.config.DUPLICATE_THRESHOLD,
             'duplicate_skipped': self.duplicate_skipped_count,
+            'current_turn': self.current_turn,
+            'access_frequency_stats_size': len(self.access_frequency_stats),
+            'cluster_search_cache_size': len(self.cluster_search_cache.cache),
+            'cache_hit_rate': (self.stats['cache_hits'] / 
+                              max(1, self.stats['cache_hits'] + self.stats['cache_misses'])),
+            'weight_config': {
+                'access_frequency_threshold': self.config.ACCESS_FREQUENCY_DISCOUNT_THRESHOLD,
+                'access_frequency_discount_factor': self.config.ACCESS_FREQUENCY_DISCOUNT_FACTOR,
+                'recency_decay_per_turn': self.config.RECENCY_WEIGHT_DECAY_PER_TURN,
+                'relative_heat_power': self.config.RELATIVE_HEAT_WEIGHT_POWER
+            },
+            'heat_distribution_config': {
+                'top3_limit': self.config.TOP3_HEAT_LIMIT_RATIO,
+                'top5_limit': self.config.TOP5_HEAT_LIMIT_RATIO,
+                'recycle_frequency': self.config.HEAT_RECYCLE_CHECK_FREQUENCY,
+                'suppression_turns': self.config.HEAT_RECYCLE_SUPPRESSION_TURNS,
+                'suppression_factor': self.config.HEAT_SUPPRESSION_FACTOR,
+                'recycle_rate': self.config.HEAT_RECYCLE_RATE,
+                'min_cluster_heat': self.config.MIN_CLUSTER_HEAT_AFTER_RECYCLE
+            }
         })
         return stats
     
     def cleanup(self):
         """清理资源"""
-        print("\n[Memory System] Cleaning up memory module...")
+        print(f"\n[Memory System] Cleaning up memory module (Final turn: {self.current_turn})...")
         
         # 执行一次最终维护任务
         self._perform_maintenance_tasks()
@@ -1890,22 +2842,144 @@ def example_usage():
         similarity_func=custom_similarity
     )
     
+    print(f"Initial turn: {memory_module.get_current_turn()}")
+    
     # 添加记忆
     memory_id = memory_module.add_memory("今天天气真好，适合出去散步")
-    print(f"Added memory: {memory_id}")
+    print(f"Added memory: {memory_id}, Current turn: {memory_module.get_current_turn()}")
     
     # 访问记忆
     memory = memory_module.access_memory(memory_id)
     if memory:
         print(f"Accessed memory: {memory.content}")
+        print(f"Created turn: {memory.created_turn}, Last interaction turn: {memory.last_interaction_turn}")
+        print(f"Update count: {memory.update_count}")
+    
+    # 测试簇内搜索
+    results = memory_module.search_within_cluster(
+        query_text="天气和散步",
+        max_results=5
+    )
+    
+    print(f"\nSearch results:")
+    for i, result in enumerate(results):
+        print(f"{i+1}. {result.memory.content[:30]}... (Score: {result.final_score:.4f})")
+        print(f"   Base similarity: {result.base_similarity:.4f}, Relative heat weight: {result.relative_heat_weight:.4f}")
+        print(f"   Access frequency weight: {result.access_frequency_weight:.4f}, Recency weight: {result.recency_weight:.4f}")
     
     # 获取统计
     stats = memory_module.get_stats()
+    print(f"\nCurrent turn: {stats['current_turn']}")
     print(f"Hot memories: {stats['hot_memories_count']}")
+    print(f"Heat distribution - Top 3: {stats.get('top3_heat_ratio', 0):.2%}, Top 5: {stats.get('top5_heat_ratio', 0):.2%}")
+    
+    # 清理
+    memory_module.cleanup()
+
+
+def advanced_example_usage():
+    """高级示例用法，展示基于轮数的时间系统和热力分布控制"""
+    # 初始化内存模块
+    memory_module = MemoryModule()
+    
+    print(f"Initial turn: {memory_module.get_current_turn()}")
+    
+    # 添加一些示例记忆
+    sample_memories = [
+        "机器学习是人工智能的重要分支",
+        "深度学习需要大量的计算资源",
+        "自然语言处理让计算机理解人类语言",
+        "卷积神经网络在图像识别中表现出色",
+        "Transformer模型彻底改变了自然语言处理",
+        "强化学习通过试错来学习最优策略",
+        "生成对抗网络可以创造逼真的图像",
+        "迁移学习利用已有知识解决新问题",
+        "自监督学习不需要人工标注的数据",
+        "联邦学习保护用户隐私的同时进行训练"
+    ]
+    
+    memory_ids = []
+    for content in sample_memories:
+        memory_id = memory_module.add_memory(content)
+        memory_ids.append(memory_id)
+        print(f"Added memory at turn {memory_module.get_current_turn()}: {content[:30]}...")
+    
+    # 模拟多次访问某些记忆，创建热力集中的簇
+    print(f"\nSimulating memory accesses to create heat concentration...")
+    for i in range(10):
+        # 频繁访问前3个记忆，使其所在簇获得更多热力
+        for j in range(0, min(3, len(memory_ids))):
+            memory_module.access_memory(memory_ids[j])
+            print(f"Turn {memory_module.get_current_turn()}: Accessed memory {memory_ids[j][:8]}...")
+    
+    # 手动触发维护任务以检查热力分布
+    print(f"\nForcing maintenance to check heat distribution...")
+    memory_module.operation_count = memory_module.MAINTENANCE_OPERATION_THRESHOLD  # 触发维护
+    memory_module._trigger_maintenance_if_needed()
+    
+    time.sleep(2)  # 等待维护任务完成
+    
+    # 获取簇统计信息
+    cluster_ids = set()
+    for memory_id in memory_ids:
+        memory = memory_module.access_memory(memory_id)
+        if memory and memory.cluster_id:
+            cluster_ids.add(memory.cluster_id)
+    
+    for cluster_id in list(cluster_ids)[:3]:  # 只显示前3个簇
+        cluster_stats = memory_module.get_cluster_statistics(cluster_id)
+        print(f"\nCluster statistics for {cluster_id}:")
+        print(f"Current turn: {cluster_stats['current_turn']}")
+        print(f"Memory count: {cluster_stats['memory_count']}")
+        print(f"Total heat: {cluster_stats['total_heat']}")
+        
+        if cluster_stats['heat_distribution']:
+            print("\nHeat distribution:")
+            for i, mem in enumerate(cluster_stats['heat_distribution'][:3]):
+                print(f"  {i+1}. ID: {mem['memory_id'][:8]}..., Heat: {mem['heat']}")
+                print(f"     Last interaction: {mem['last_interaction_turn']} "
+                      f"(Turns since: {mem['turns_since_interaction']})")
+                print(f"     Access frequency weight: {mem['access_frequency_weight']:.4f}")
+    
+    # 测试加权搜索
+    print(f"\n\nTesting weighted search...")
+    query = "人工智能和机器学习"
+    results = memory_module.search_within_cluster(
+        query_text=query,
+        max_results=3
+    )
+    
+    for i, result in enumerate(results):
+        print(f"{i+1}. {result.memory.content[:40]}...")
+        print(f"   Final score: {result.final_score:.4f}")
+        print(f"   Access frequency weight: {result.access_frequency_weight:.4f}")
+        print(f"   Recency weight: {result.recency_weight:.4f}")
+        print(f"   Last interaction turn: {result.memory.last_interaction_turn}")
+    
+    # 获取系统统计
+    stats = memory_module.get_stats()
+    print(f"\n\nFinal system statistics:")
+    print(f"Current turn: {stats['current_turn']}")
+    print(f"Total operations: {stats['operation_count']}")
+    print(f"Cache hits: {stats['cache_hits']}, Misses: {stats['cache_misses']}")
+    print(f"High frequency memories: {stats['high_frequency_memories']}")
+    print(f"Heat distribution - Top 3: {stats.get('top3_heat_ratio', 0):.2%}, Top 5: {stats.get('top5_heat_ratio', 0):.2%}")
+    print(f"Heat redistributions: {stats.get('heat_redistributions', 0)}")
+    print(f"Heat recycled to pool: {stats.get('heat_recycled_to_pool', 0)}")
+    print(f"In suppression period: {stats.get('in_suppression_period', False)}")
+    print(f"Suppression factor: {stats.get('suppression_factor', 1.0):.2f}")
     
     # 清理
     memory_module.cleanup()
 
 
 if __name__ == "__main__":
+    print("="*80)
+    print("Basic example usage:")
+    print("="*80)
     example_usage()
+    
+    print("\n" + "="*80)
+    print("Advanced example usage with turn-based time system and heat distribution control:")
+    print("="*80)
+    advanced_example_usage()

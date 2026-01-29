@@ -106,6 +106,43 @@ class Config:
     HEAT_SUPPRESSION_FACTOR = 0.7  # 抑制期内新增热力系数
     MIN_CLUSTER_HEAT_AFTER_RECYCLE = 100  # 回收后簇的最小热力
     HEAT_RECYCLE_RATE = 0.1  # 每次回收比例（线性）
+    
+    # 新增：分层记忆读取配置
+    LAYERED_SEARCH_CONFIG = {
+        "layer_1": {
+            "similarity_range": (0.75, 0.80),
+            "max_results": 2,
+            "heat_weight_factor": 0.3,  # 热力权重系数
+            "frequency_weight_factor": 0.5,  # 频率权重系数
+            "recency_weight_factor": 0.8,  # 最近访问权重系数
+            "base_score_factor": 1.0,  # 基础相似度权重
+            "min_heat_required": 10  # 最低热力要求
+        },
+        "layer_2": {
+            "similarity_range": (0.80, 0.85),
+            "max_results": 2,
+            "heat_weight_factor": 0.5,
+            "frequency_weight_factor": 0.7,
+            "recency_weight_factor": 0.9,
+            "base_score_factor": 1.0,
+            "min_heat_required": 20
+        },
+        "layer_3": {
+            "similarity_range": (0.85, 0.95),
+            "max_results": 4,
+            "heat_weight_factor": 0.8,
+            "frequency_weight_factor": 0.9,
+            "recency_weight_factor": 1.0,
+            "base_score_factor": 1.0,
+            "min_heat_required": 30
+        }
+    }
+    
+    # 分层搜索的全局配置
+    LAYERED_SEARCH_ENABLED = True  # 是否启用分层搜索
+    LAYERED_SEARCH_FALLBACK = False  # 当某个层找不到足够记忆时，是否用其他层补充
+    LAYERED_SEARCH_MAX_TOTAL_RESULTS = 8  # 最大总返回结果数
+    LAYERED_SEARCH_DEDUPLICATE = True  # 是否跨层去重
 
 # =============== 枚举和常量 ===============
 class OperationType(Enum):
@@ -256,6 +293,18 @@ class WeightedMemoryResult:
     final_score: float  # 最终加权得分
     ranking_position: int  # 排名位置
 
+# =============== 分层搜索结果 ===============
+@dataclass
+class LayeredSearchResult:
+    """分层搜索结果"""
+    layer_name: str
+    similarity_range: Tuple[float, float]
+    results: List[WeightedMemoryResult]
+    achieved_count: int
+    target_count: int
+    avg_similarity: float
+    avg_final_score: float
+
 # =============== 簇内搜索缓存 ===============
 class ClusterSearchCache:
     """簇内搜索缓存（基于轮数的TTL）"""
@@ -337,6 +386,86 @@ class ClusterSearchCache:
         similarity = np.dot(vec1, vec2) / (norm1 * norm2)
         return similarity >= threshold
 
+# =============== 向量缓存系统 ===============
+@dataclass
+class VectorCache:
+    """向量缓存系统"""
+    vectors: np.ndarray = None  # (M, d) 所有向量
+    memory_ids: List[str] = None  # 对应ID列表
+    last_updated: float = 0
+    is_valid: bool = False
+
+class SimilarityCache:
+    """相似度计算结果缓存"""
+    def __init__(self, max_size=100, ttl_seconds=300):
+        self.max_size = max_size
+        self.ttl_seconds = ttl_seconds
+        self.cache: Dict[str, Dict] = {}  # query_hash -> {similarities, timestamp}
+        self.lock = threading.RLock()
+        self.hit_count = 0
+        self.miss_count = 0
+        
+    def get(self, query_vector: np.ndarray) -> Optional[np.ndarray]:
+        """获取缓存的相似度结果"""
+        query_hash = self._hash_vector(query_vector)
+        
+        with self.lock:
+            if query_hash not in self.cache:
+                self.miss_count += 1
+                return None
+            
+            cache_entry = self.cache[query_hash]
+            
+            # 检查是否过期
+            if time.time() - cache_entry['timestamp'] > self.ttl_seconds:
+                del self.cache[query_hash]
+                self.miss_count += 1
+                return None
+            
+            self.hit_count += 1
+            return cache_entry['similarities']
+    
+    def put(self, query_vector: np.ndarray, similarities: np.ndarray):
+        """存储相似度结果"""
+        query_hash = self._hash_vector(query_vector)
+        
+        with self.lock:
+            # LRU淘汰
+            if len(self.cache) >= self.max_size:
+                oldest_key = None
+                oldest_time = float('inf')
+                
+                for key, entry in self.cache.items():
+                    if entry['timestamp'] < oldest_time:
+                        oldest_time = entry['timestamp']
+                        oldest_key = key
+                
+                if oldest_key:
+                    del self.cache[oldest_key]
+            
+            self.cache[query_hash] = {
+                'similarities': similarities.copy(),
+                'timestamp': time.time()
+            }
+    
+    def _hash_vector(self, vector: np.ndarray) -> str:
+        """向量哈希（近似）"""
+        # 取前8个浮点数的字节作为哈希
+        return hashlib.md5(vector[:8].tobytes()).hexdigest()[:16]
+    
+    def get_stats(self):
+        """获取缓存统计"""
+        with self.lock:
+            total = self.hit_count + self.miss_count
+            hit_rate = self.hit_count / total if total > 0 else 0
+            return {
+                'size': len(self.cache),
+                'max_size': self.max_size,
+                'hit_count': self.hit_count,
+                'miss_count': self.miss_count,
+                'hit_rate': hit_rate
+            }
+
 # =============== 分布式锁管理器 ===============
 class DistributedLockManager:
     """分布式锁管理器，支持超时和重试"""
@@ -410,10 +539,12 @@ class DistributedLockManager:
 
 # =============== 核心内存管理模块 ===============
 class MemoryModule:
-    """内存管理模块 - 纯事件驱动设计，基于轮数的时间系统"""
+    """内存管理模块 - 纯事件驱动设计，基于轮数的时间系统，带NumPy向量化优化"""
     
     def __init__(self, embedding_func=None, similarity_func=None):
         self.config = Config()
+        
+        self.embedding_dim = self.config.EMBEDDING_DIM
         
         # 基于轮数的时间系统
         self.current_turn = self.config.INITIAL_TURN  # 当前轮数（全局时间锚点）
@@ -489,6 +620,18 @@ class MemoryModule:
         self.heat_recycle_count: int = 0  # 热力回收次数统计
         self.cluster_heat_history: Dict[str, List[Tuple[int, int]]] = {}  # 簇热力历史记录 (turn, heat)
         
+        # 新增：向量化优化相关缓存
+        self.vector_cache = VectorCache()
+        self.vector_cache_lock = threading.RLock()
+        self.similarity_cache = SimilarityCache(max_size=100, ttl_seconds=300)
+        self.weight_cache: Dict[str, Dict] = {}  # memory_id -> 预计算权重
+        self.weight_cache_turn = 0  # 权重缓存对应的轮数
+        
+        # 预计算归一化向量缓存
+        self._normalized_vectors: Optional[np.ndarray] = None
+        self._precomputed_memory_norms: Optional[np.ndarray] = None
+        self._precomputed_query_norms: Dict[str, float] = {}  # 查询向量范数缓存
+        
         # 统计信息
         self.stats = {
             'total_memories': 0,
@@ -511,15 +654,20 @@ class MemoryModule:
             'weight_adjustments': 0,
             'high_frequency_memories': 0,
             'current_turn': self.current_turn,
-            'heat_redistributions': 0,  # 新增
-            'heat_recycled_to_pool': 0,  # 新增
-            'suppressed_memory_additions': 0,  # 新增
+            'heat_redistributions': 0,
+            'heat_recycled_to_pool': 0,
+            'suppressed_memory_additions': 0,
+            'layered_searches': 0,
+            'vectorized_searches': 0,
+            'similarity_cache_hits': 0,
+            'similarity_cache_misses': 0,
         }
         
         # 加载系统状态
         self._load_system_state()
         
         print(f"Memory Module initialized with PURE event-driven design and TURN-based time system")
+        print(f"NumPy vectorization and caching ENABLED")
         print(f"No background maintenance threads - all maintenance triggered by events")
         print(f"Current turn: {self.current_turn}")
         print(f"Embedding model: {'External' if self._external_embedding_func else 'Internal'}")
@@ -531,6 +679,8 @@ class MemoryModule:
         print(f"Cluster search enabled with cache size {self.config.CLUSTER_SEARCH_CACHE_SIZE}")
         print(f"Heat distribution control enabled: Top 3 ≤ {self.config.TOP3_HEAT_LIMIT_RATIO:.0%}, "
               f"Top 5 ≤ {self.config.TOP5_HEAT_LIMIT_RATIO:.0%}")
+        print(f"Layered search enabled: {'Yes' if self.config.LAYERED_SEARCH_ENABLED else 'No'}")
+        print(f"Vector cache: Initialized (size: {len(self.hot_memories)})")
     
     def _increment_turn(self, increment: int = 1) -> int:
         """增加轮数并返回新的轮数"""
@@ -744,6 +894,9 @@ class MemoryModule:
                     cluster.is_loaded = True
         
         print(f"Loaded {len(self.hot_memories)} hot memories from database")
+        
+        # 初始化向量缓存
+        self._rebuild_vector_cache()
     
     def _load_access_frequency_stats(self):
         """加载访问频率统计"""
@@ -1131,6 +1284,9 @@ class MemoryModule:
         for cluster_info in cluster_heat_list[:5]:
             cluster_id = cluster_info['cluster_id']
             self.cluster_search_cache.clear(cluster_id)
+        
+        # 使向量缓存失效（因为热力已改变）
+        self.invalidate_vector_cache()
     
     def _is_in_suppression_period(self) -> bool:
         """检查是否处于热力回收抑制期"""
@@ -1376,6 +1532,10 @@ class MemoryModule:
                 heat_delta = new_heat - operation['old_heat']
                 if heat_delta != 0:
                     self._update_cluster_heat(cluster_id, heat_delta, immediate)
+        
+        # 使权重缓存失效
+        if memory_id in self.weight_cache:
+            del self.weight_cache[memory_id]
     
     def _apply_cluster_heat_update(self, operation: Dict, immediate: bool):
         """应用簇热力更新"""
@@ -1401,6 +1561,9 @@ class MemoryModule:
                 else:
                     # 延迟更新，先记录到pending
                     cluster.pending_heat_delta += heat_delta
+        
+        # 使权重缓存失效（因为簇总热力已改变）
+        self.weight_cache.clear()
     
     def _log_operation(self, operation: Dict, applied: bool = False):
         """记录操作到日志"""
@@ -1442,6 +1605,9 @@ class MemoryModule:
                 'heat_delta': heat_delta,
                 'turn': self.current_turn
             })
+        
+        # 使权重缓存失效
+        self.weight_cache.clear()
     
     def _update_memory_and_cluster_heat_atomic(self, memory_id: str, new_heat: int, 
                                               cluster_id: str = None, 
@@ -1520,6 +1686,10 @@ class MemoryModule:
         for memory_id, new_heat in memory_updates.items():
             if memory_id in self.hot_memories:
                 self.hot_memories[memory_id].heat = new_heat
+        
+        # 使缓存失效
+        if cluster_updates or memory_updates:
+            self.weight_cache.clear()
     
     def _apply_pending_cluster_updates(self):
         """应用pending的簇更新"""
@@ -1544,6 +1714,9 @@ class MemoryModule:
                         with self.clusters[cluster_id].lock:
                             self.clusters[cluster_id].total_heat += pending_delta
                             self.clusters[cluster_id].pending_heat_delta = 0
+            
+            # 使权重缓存失效
+            self.weight_cache.clear()
     
     # =============== 重复检测方法 ===============
     def _check_duplicate(self, vector: np.ndarray, content: str = None) -> Optional[str]:
@@ -1677,6 +1850,10 @@ class MemoryModule:
             
             self.stats['centroid_updates'] += len(centroid_updates)
             print(f"[Memory System] Updated centroids for {len(centroid_updates)} clusters")
+            
+            # 清除簇搜索缓存
+            for cluster_id in cluster_ids:
+                self.cluster_search_cache.clear(cluster_id)
     
     def _incremental_update_cluster_centroid(self, cluster: SemanticCluster) -> Optional[np.ndarray]:
         """增量更新簇质心"""
@@ -1760,6 +1937,9 @@ class MemoryModule:
         # 更新全局计数器
         if add:
             self.memory_additions_since_last_centroid_update += 1
+        
+        # 使向量缓存失效
+        self.invalidate_vector_cache()
     
     # =============== 嵌入和相似度计算（支持外部函数） ===============
     
@@ -1817,6 +1997,10 @@ class MemoryModule:
                     stats['count'] = 1
                     stats['last_reset_turn'] = self.current_turn
                     stats['recent_interactions'] = [self.current_turn]
+        
+        # 使权重缓存失效
+        if memory_id in self.weight_cache:
+            del self.weight_cache[memory_id]
     
     def _get_access_frequency_weight(self, memory_id: str, memory_item: MemoryItem) -> float:
         """获取访问频率权重（过度访问会降低权重）"""
@@ -1872,6 +2056,603 @@ class MemoryModule:
         weight = max(0.1, min(1.0, weight))
         
         return weight
+    
+    # =============== 向量化优化方法 ===============
+    
+    def _rebuild_vector_cache(self):
+        """重建向量缓存"""
+        with self.vector_cache_lock:
+            memory_ids = []
+            vectors = []
+            
+            for memory_id, memory in self.hot_memories.items():
+                memory_ids.append(memory_id)
+                vectors.append(memory.vector)
+            
+            if vectors:
+                self.vector_cache.vectors = np.array(vectors, dtype=np.float32)  # (M, d)
+            else:
+                self.vector_cache.vectors = np.zeros((0, self.embedding_dim), dtype=np.float32)
+            
+            self.vector_cache.memory_ids = memory_ids
+            self.vector_cache.last_updated = time.time()
+            self.vector_cache.is_valid = True
+            
+            # 清除预计算的归一化向量
+            self._normalized_vectors = None
+            self._precomputed_memory_norms = None
+            
+            print(f"[Vector Cache] Rebuilt cache with {len(memory_ids)} vectors")
+    
+    def _ensure_vector_cache(self):
+        """确保向量缓存是最新的"""
+        with self.vector_cache_lock:
+            if (self.vector_cache.is_valid and 
+                self.vector_cache.vectors is not None and
+                len(self.vector_cache.memory_ids) == len(self.hot_memories)):
+                return  # 缓存有效
+            
+            self._rebuild_vector_cache()
+    
+    def _compute_all_similarities_vectorized(self, query_vector: np.ndarray) -> np.ndarray:
+        """向量化计算所有相似度"""
+        # 1. 确保向量缓存有效
+        self._ensure_vector_cache()
+        
+        vectors = self.vector_cache.vectors
+        if vectors.shape[0] == 0:
+            return np.array([])
+        
+        # 2. 归一化查询向量（一次性）
+        query_norm = np.linalg.norm(query_vector)
+        if query_norm == 0:
+            return np.zeros(vectors.shape[0])
+        
+        normalized_query = query_vector / query_norm
+        
+        # 3. 预归一化所有记忆向量（缓存）
+        if self._normalized_vectors is None or self._precomputed_memory_norms is None:
+            # 计算并缓存记忆向量的范数
+            memory_norms = np.linalg.norm(vectors, axis=1)
+            # 避免除零
+            memory_norms[memory_norms == 0] = 1e-10
+            self._normalized_vectors = vectors / memory_norms[:, np.newaxis]
+            self._precomputed_memory_norms = memory_norms
+        
+        # 4. 向量化点积计算（单次矩阵运算）
+        similarities = np.dot(self._normalized_vectors, normalized_query)
+        
+        # 5. 确保相似度在有效范围内
+        similarities = np.clip(similarities, -1.0, 1.0)
+        
+        return similarities
+    
+    def _get_cached_similarities(self, query_vector: np.ndarray) -> np.ndarray:
+        """获取缓存的相似度（计算或从缓存获取）"""
+        # 1. 检查缓存
+        cached_similarities = self.similarity_cache.get(query_vector)
+        if cached_similarities is not None:
+            self.stats['similarity_cache_hits'] += 1
+            return cached_similarities
+        
+        self.stats['similarity_cache_misses'] += 1
+        
+        # 2. 计算并缓存
+        similarities = self._compute_all_similarities_vectorized(query_vector)
+        self.similarity_cache.put(query_vector, similarities)
+        
+        return similarities
+    
+    def _ensure_weight_cache(self):
+        """确保权重缓存是最新的（基于轮数）"""
+        current_turn = self.current_turn
+        
+        # 每100轮或记忆数量变化时更新权重缓存
+        if (current_turn - self.weight_cache_turn > 100 or
+            len(self.weight_cache) != len(self.hot_memories)):
+            
+            with self.frequency_stats_lock:
+                self.weight_cache.clear()
+                
+                for memory_id, memory in self.hot_memories.items():
+                    cluster_total_heat = self.clusters[memory.cluster_id].total_heat if memory.cluster_id in self.clusters else 1
+                    
+                    # 预计算常用权重
+                    self.weight_cache[memory_id] = {
+                        'relative_heat_weight': self._get_relative_heat_weight(memory, cluster_total_heat),
+                        'access_frequency_weight': self._get_access_frequency_weight(memory_id, memory),
+                        'recency_weight': self._get_recency_weight(memory),
+                        'heat': memory.heat,
+                        'last_updated_turn': current_turn
+                    }
+            
+            self.weight_cache_turn = current_turn
+            print(f"[Weight Cache] Updated cache for {len(self.weight_cache)} memories (turn: {current_turn})")
+    
+    def invalidate_vector_cache(self, memory_id: str = None, operation: str = 'update'):
+        """使向量缓存失效"""
+        with self.vector_cache_lock:
+            if memory_id and self.vector_cache.is_valid and self.vector_cache.vectors is not None:
+                # 尝试增量更新
+                if memory_id in self.vector_cache.memory_ids:
+                    idx = self.vector_cache.memory_ids.index(memory_id)
+                    memory = self.hot_memories.get(memory_id)
+                    if memory:
+                        self.vector_cache.vectors[idx] = memory.vector
+                        
+                        # 使预计算的归一化向量失效
+                        self._normalized_vectors = None
+                        self._precomputed_memory_norms = None
+            else:
+                # 完全失效
+                self.vector_cache.is_valid = False
+        
+        # 清除相似度缓存
+        self.similarity_cache.cache.clear()
+    
+    # =============== 分层搜索方法（向量化优化版） ===============
+    
+    def search_layered_memories(self, query_text: str = None, query_vector: np.ndarray = None,
+                               max_total_results: int = None,
+                               config_override: Dict = None) -> Dict[str, LayeredSearchResult]:
+        """优化的分层搜索 - 使用向量化和缓存"""
+        if not self.config.LAYERED_SEARCH_ENABLED:
+            warnings.warn("Layered search is disabled. Using default search.")
+            return self._fallback_search(query_text, query_vector, max_total_results)
+        
+        if query_vector is None and query_text is not None:
+            query_vector = self._get_embedding(query_text)
+        elif query_vector is None:
+            raise ValueError("Either query_text or query_vector must be provided")
+        
+        # 使用配置覆盖或默认配置
+        config = config_override or self.config.LAYERED_SEARCH_CONFIG
+        
+        if max_total_results is None:
+            max_total_results = self.config.LAYERED_SEARCH_MAX_TOTAL_RESULTS
+        
+        # 记录搜索统计
+        self.stats['layered_searches'] += 1
+        self.stats['vectorized_searches'] += 1
+        
+        # ========= 优化1：向量化相似度计算 =========
+        start_time = time.time()
+        similarities = self._get_cached_similarities(query_vector)
+        sim_compute_time = time.time() - start_time
+        
+        # ========= 优化2：预计算权重缓存 =========
+        self._ensure_weight_cache()
+        
+        # ========= 优化3：向量化分层筛选 =========
+        memory_ids = self.vector_cache.memory_ids
+        layered_results = {}
+        
+        # 为去重准备集合
+        seen_memory_ids = set() if self.config.LAYERED_SEARCH_DEDUPLICATE else None
+        
+        # 按层处理（从高相似度到低相似度）
+        for layer_name in ["layer_3", "layer_2", "layer_1"]:
+            if layer_name not in config:
+                continue
+            
+            layer_config = config[layer_name]
+            similarity_min, similarity_max = layer_config["similarity_range"]
+            max_results = layer_config["max_results"]
+            min_heat = layer_config.get("min_heat_required", 0)
+            
+            # 向量化筛选：找到在范围内的记忆索引
+            mask = (similarities >= similarity_min) & (similarities < similarity_max)
+            candidate_indices = np.where(mask)[0]
+            
+            if candidate_indices.size == 0:
+                # 该层没有结果
+                layered_results[layer_name] = LayeredSearchResult(
+                    layer_name=layer_name,
+                    similarity_range=(similarity_min, similarity_max),
+                    results=[],
+                    achieved_count=0,
+                    target_count=max_results,
+                    avg_similarity=0.0,
+                    avg_final_score=0.0
+                )
+                continue
+            
+            # 如果启用去重，过滤已选中的记忆
+            if seen_memory_ids is not None and candidate_indices.size > 0:
+                valid_indices = []
+                for idx in candidate_indices:
+                    memory_id = memory_ids[idx]
+                    if memory_id not in seen_memory_ids:
+                        valid_indices.append(idx)
+                candidate_indices = np.array(valid_indices)
+            
+            # ========= 优化4：批量处理候选记忆 =========
+            layer_results = []
+            candidates_processed = 0
+            
+            # 按相似度排序（只取前N个）
+            sorted_indices = candidate_indices[np.argsort(-similarities[candidate_indices])]
+            
+            for idx in sorted_indices[:max_results]:
+                memory_id = memory_ids[idx]
+                memory = self.hot_memories[memory_id]
+                
+                # 检查最低热力要求
+                if memory.heat < min_heat:
+                    continue
+                
+                # 从权重缓存获取权重（避免重复计算）
+                cached_weights = self.weight_cache.get(memory_id, {})
+                if not cached_weights:
+                    # 缓存未命中，重新计算
+                    cluster_total_heat = self.clusters[memory.cluster_id].total_heat if memory.cluster_id in self.clusters else 1
+                    
+                    relative_heat_weight = self._get_relative_heat_weight(memory, cluster_total_heat)
+                    access_frequency_weight = self._get_access_frequency_weight(memory_id, memory)
+                    recency_weight = self._get_recency_weight(memory)
+                else:
+                    relative_heat_weight = cached_weights['relative_heat_weight']
+                    access_frequency_weight = cached_weights['access_frequency_weight']
+                    recency_weight = cached_weights['recency_weight']
+                
+                # 应用层特定的权重系数
+                heat_weight_factor = layer_config.get("heat_weight_factor", 1.0)
+                frequency_weight_factor = layer_config.get("frequency_weight_factor", 1.0)
+                recency_weight_factor = layer_config.get("recency_weight_factor", 1.0)
+                base_score_factor = layer_config.get("base_score_factor", 1.0)
+                
+                # 调整后的权重
+                adj_relative_heat_weight = relative_heat_weight * heat_weight_factor
+                adj_access_frequency_weight = access_frequency_weight * frequency_weight_factor
+                adj_recency_weight = recency_weight * recency_weight_factor
+                adj_base_similarity = similarities[idx] * base_score_factor
+                
+                # 最终得分（加权几何平均）
+                weights = [adj_relative_heat_weight, adj_access_frequency_weight, adj_recency_weight]
+                weights_nonzero = [max(0.0001, w) for w in weights]
+                geometric_mean = np.exp(np.mean(np.log(weights_nonzero)))
+                
+                final_score = adj_base_similarity * geometric_mean
+                
+                # 创建结果对象
+                result = WeightedMemoryResult(
+                    memory=memory,
+                    base_similarity=similarities[idx],
+                    relative_heat_weight=adj_relative_heat_weight,
+                    access_frequency_weight=adj_access_frequency_weight,
+                    recency_weight=adj_recency_weight,
+                    final_score=final_score,
+                    ranking_position=len(layer_results) + 1
+                )
+                
+                layer_results.append(result)
+                candidates_processed += 1
+                
+                # 记录已选记忆ID
+                if seen_memory_ids is not None:
+                    seen_memory_ids.add(memory_id)
+                
+                # 如果达到该层目标数量，提前退出
+                if candidates_processed >= max_results:
+                    break
+            
+            # 计算统计信息
+            achieved_count = len(layer_results)
+            if achieved_count > 0:
+                avg_similarity = np.mean([r.base_similarity for r in layer_results])
+                avg_final_score = np.mean([r.final_score for r in layer_results])
+            else:
+                avg_similarity = 0.0
+                avg_final_score = 0.0
+            
+            # 存储层结果
+            layered_results[layer_name] = LayeredSearchResult(
+                layer_name=layer_name,
+                similarity_range=(similarity_min, similarity_max),
+                results=layer_results,
+                achieved_count=achieved_count,
+                target_count=max_results,
+                avg_similarity=avg_similarity,
+                avg_final_score=avg_final_score
+            )
+            
+            # 如果已收集足够总结果，提前退出
+            total_results = sum(len(r.results) for r in layered_results.values())
+            if total_results >= max_total_results:
+                break
+        
+        # 添加性能统计
+        total_time = time.time() - start_time
+        if total_time > 0.1:  # 超过100ms时记录警告
+            print(f"[Performance] Vectorized layered search: {total_time*1000:.1f}ms "
+                  f"(similarity: {sim_compute_time*1000:.1f}ms)")
+        
+        return layered_results
+    
+    def _apply_fallback(self, layered_results: Dict[str, LayeredSearchResult],
+                       config: Dict, query_vector: np.ndarray,
+                       max_total_results: int, exclude_ids: Set[str]):
+        """应用后备策略：当某些层结果不足时，用其他层补充"""
+        total_results = sum(len(r.results) for r in layered_results.values())
+        
+        if total_results >= max_total_results:
+            return
+        
+        # 确定需要补充的结果数
+        needed_results = max_total_results - total_results
+        
+        # 找出结果不足的层
+        deficient_layers = []
+        for layer_name, result in layered_results.items():
+            if result.achieved_count < result.target_count:
+                deficit = result.target_count - result.achieved_count
+                deficient_layers.append((layer_name, deficit, result.similarity_range))
+        
+        # 如果没有不足的层，直接返回
+        if not deficient_layers:
+            return
+        
+        # 按不足程度排序（最不足的优先）
+        deficient_layers.sort(key=lambda x: x[1], reverse=True)
+        
+        # 后备搜索：从相似度稍低的层中寻找补充
+        for layer_name, deficit, (similarity_min, similarity_max) in deficient_layers:
+            if needed_results <= 0:
+                break
+            
+            # 计算后备搜索范围（降低相似度要求）
+            fallback_min = max(0.5, similarity_min - 0.1)  # 至少0.5相似度
+            fallback_max = similarity_max
+            
+            # 在更宽泛的范围内搜索
+            fallback_results = self._search_within_layer_legacy(
+                query_vector=query_vector,
+                similarity_min=fallback_min,
+                similarity_max=fallback_max,
+                max_results=deficit,
+                min_heat=0,  # 后备搜索降低热力要求
+                layer_config=config.get(layer_name, {}),
+                exclude_ids=exclude_ids
+            )
+            
+            # 添加后备结果
+            if fallback_results:
+                current_results = layered_results[layer_name].results
+                current_results.extend(fallback_results)
+                
+                # 重新排序
+                current_results.sort(key=lambda x: x.final_score, reverse=True)
+                current_results = current_results[:layered_results[layer_name].target_count]
+                
+                # 更新统计
+                achieved_count = len(current_results)
+                if achieved_count > 0:
+                    avg_similarity = sum(r.base_similarity for r in current_results) / achieved_count
+                    avg_final_score = sum(r.final_score for r in current_results) / achieved_count
+                else:
+                    avg_similarity = 0.0
+                    avg_final_score = 0.0
+                
+                # 更新层结果
+                layered_results[layer_name] = LayeredSearchResult(
+                    layer_name=layer_name,
+                    similarity_range=layered_results[layer_name].similarity_range,
+                    results=current_results,
+                    achieved_count=achieved_count,
+                    target_count=layered_results[layer_name].target_count,
+                    avg_similarity=avg_similarity,
+                    avg_final_score=avg_final_score
+                )
+                
+                # 更新已见ID集合
+                if exclude_ids is not None:
+                    for result in fallback_results:
+                        exclude_ids.add(result.memory.id)
+                
+                needed_results -= len(fallback_results)
+    
+    def _search_within_layer_legacy(self, query_vector: np.ndarray,
+                                   similarity_min: float, similarity_max: float,
+                                   max_results: int, min_heat: int,
+                                   layer_config: Dict,
+                                   exclude_ids: Set[str] = None) -> List[WeightedMemoryResult]:
+        """传统方法在特定相似度层内搜索记忆（用于后备搜索）"""
+        candidates = []
+        
+        # 遍历热区记忆
+        for memory_id, memory in self.hot_memories.items():
+            # 排除条件
+            if memory.is_sleeping:
+                continue
+            
+            if exclude_ids and memory_id in exclude_ids:
+                continue
+            
+            if memory.heat < min_heat:
+                continue
+            
+            # 计算相似度
+            similarity = self._compute_similarity(query_vector, memory.vector)
+            
+            # 检查是否在目标层内
+            if similarity_min <= similarity < similarity_max:
+                # 计算各种权重
+                cluster_total_heat = self.clusters[memory.cluster_id].total_heat if memory.cluster_id in self.clusters else 1
+                
+                relative_heat_weight = self._get_relative_heat_weight(memory, cluster_total_heat)
+                access_frequency_weight = self._get_access_frequency_weight(memory_id, memory)
+                recency_weight = self._get_recency_weight(memory)
+                
+                # 应用层特定的权重系数
+                heat_weight_factor = layer_config.get("heat_weight_factor", 1.0)
+                frequency_weight_factor = layer_config.get("frequency_weight_factor", 1.0)
+                recency_weight_factor = layer_config.get("recency_weight_factor", 1.0)
+                base_score_factor = layer_config.get("base_score_factor", 1.0)
+                
+                # 调整后的权重
+                adj_relative_heat_weight = (relative_heat_weight * heat_weight_factor)
+                adj_access_frequency_weight = (access_frequency_weight * frequency_weight_factor)
+                adj_recency_weight = (recency_weight * recency_weight_factor)
+                adj_base_similarity = similarity * base_score_factor
+                
+                # 最终得分（使用加权几何平均）
+                weights = [adj_relative_heat_weight, adj_access_frequency_weight, adj_recency_weight]
+                geometric_mean = np.exp(np.mean(np.log([max(0.0001, w) for w in weights])))
+                
+                final_score = adj_base_similarity * geometric_mean
+                
+                # 创建结果对象
+                result = WeightedMemoryResult(
+                    memory=memory,
+                    base_similarity=similarity,
+                    relative_heat_weight=adj_relative_heat_weight,
+                    access_frequency_weight=adj_access_frequency_weight,
+                    recency_weight=adj_recency_weight,
+                    final_score=final_score,
+                    ranking_position=0
+                )
+                
+                candidates.append((final_score, result))
+        
+        # 按最终得分排序并限制数量
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        selected_candidates = candidates[:max_results]
+        
+        # 创建最终结果列表
+        results = [result for _, result in selected_candidates]
+        
+        # 设置排名
+        for i, result in enumerate(results):
+            result.ranking_position = i + 1
+        
+        return results
+    
+    def _fallback_search(self, query_text: str = None, query_vector: np.ndarray = None,
+                        max_total_results: int = None) -> Dict[str, LayeredSearchResult]:
+        """后备搜索方法（当分层搜索被禁用时）"""
+        if query_vector is None and query_text is not None:
+            query_vector = self._get_embedding(query_text)
+        
+        if max_total_results is None:
+            max_total_results = 8
+        
+        # 使用默认搜索
+        all_results = self.search_similar_memories(
+            query_vector=query_vector,
+            max_results=max_total_results,
+            use_weighting=True
+        )
+        
+        # 将结果分配到虚拟层中（用于统一接口）
+        layered_results = {}
+        default_layers = {
+            "layer_1": {"similarity_range": (0.0, 1.0), "results": [], "count": 0},
+            "layer_2": {"similarity_range": (0.0, 1.0), "results": [], "count": 0},
+            "layer_3": {"similarity_range": (0.0, 1.0), "results": [], "count": 0}
+        }
+        
+        # 简单分配：按相似度分配到不同层
+        for result in all_results:
+            if result.base_similarity >= 0.85:
+                default_layers["layer_3"]["results"].append(result)
+            elif result.base_similarity >= 0.80:
+                default_layers["layer_2"]["results"].append(result)
+            elif result.base_similarity >= 0.75:
+                default_layers["layer_1"]["results"].append(result)
+        
+        # 转换为LayeredSearchResult格式
+        for layer_name, layer_data in default_layers.items():
+            results = layer_data["results"]
+            achieved_count = len(results)
+            
+            if achieved_count > 0:
+                avg_similarity = sum(r.base_similarity for r in results) / achieved_count
+                avg_final_score = sum(r.final_score for r in results) / achieved_count
+            else:
+                avg_similarity = 0.0
+                avg_final_score = 0.0
+            
+            layered_results[layer_name] = LayeredSearchResult(
+                layer_name=layer_name,
+                similarity_range=layer_data["similarity_range"],
+                results=results,
+                achieved_count=achieved_count,
+                target_count=0,  # 虚拟层没有目标数量
+                avg_similarity=avg_similarity,
+                avg_final_score=avg_final_score
+            )
+        
+        return layered_results
+    
+    def get_layered_search_results(self, query_text: str = None, query_vector: np.ndarray = None,
+                                  flatten_results: bool = True) -> List[WeightedMemoryResult]:
+        """
+        获取分层搜索结果（扁平化版本）
+        
+        参数:
+            query_text: 查询文本
+            query_vector: 查询向量
+            flatten_results: 是否将分层结果扁平化为一个列表
+            
+        返回:
+            如果flatten_results=True，返回扁平化的WeightedMemoryResult列表
+            否则返回分层的LayeredSearchResult字典
+        """
+        layered_results = self.search_layered_memories(
+            query_text=query_text,
+            query_vector=query_vector
+        )
+        
+        if not flatten_results:
+            return layered_results
+        
+        # 扁平化结果：按照层优先级（layer_3 > layer_2 > layer_1）合并
+        flattened = []
+        for layer_name in ["layer_3", "layer_2", "layer_1"]:
+            if layer_name in layered_results:
+                layer_result = layered_results[layer_name]
+                flattened.extend(layer_result.results)
+        
+        return flattened
+    
+    def update_layered_search_config(self, new_config: Dict = None, **kwargs):
+        """更新分层搜索配置"""
+        if new_config:
+            # 完全替换配置
+            self.config.LAYERED_SEARCH_CONFIG = new_config
+        else:
+            # 部分更新配置
+            for key, value in kwargs.items():
+                if hasattr(self.config, key):
+                    setattr(self.config, key, value)
+                else:
+                    warnings.warn(f"Unknown config key: {key}")
+        
+        print(f"Layered search config updated")
+        print(f"Current config: {self.config.LAYERED_SEARCH_CONFIG}")
+    
+    def get_layered_search_stats(self) -> Dict[str, Any]:
+        """获取分层搜索统计信息"""
+        stats = {
+            'enabled': self.config.LAYERED_SEARCH_ENABLED,
+            'fallback_enabled': self.config.LAYERED_SEARCH_FALLBACK,
+            'deduplicate_enabled': self.config.LAYERED_SEARCH_DEDUPLICATE,
+            'max_total_results': self.config.LAYERED_SEARCH_MAX_TOTAL_RESULTS,
+            'layers': {}
+        }
+        
+        # 添加各层配置详情
+        for layer_name, layer_config in self.config.LAYERED_SEARCH_CONFIG.items():
+            stats['layers'][layer_name] = {
+                'similarity_range': layer_config.get('similarity_range', (0, 0)),
+                'max_results': layer_config.get('max_results', 0),
+                'heat_weight_factor': layer_config.get('heat_weight_factor', 1.0),
+                'frequency_weight_factor': layer_config.get('frequency_weight_factor', 1.0),
+                'recency_weight_factor': layer_config.get('recency_weight_factor', 1.0),
+                'min_heat_required': layer_config.get('min_heat_required', 0)
+            }
+        
+        return stats
     
     # =============== 簇内搜索方法 ===============
     
@@ -2150,6 +2931,9 @@ class MemoryModule:
                         'last_reset_turn': self.current_turn,
                         'recent_interactions': [self.current_turn]
                     }
+        
+        # 使权重缓存失效
+        self.weight_cache.clear()
     
     def adjust_memory_weights(self, memory_id: str, 
                              heat_adjustment: float = 1.0,
@@ -2185,12 +2969,16 @@ class MemoryModule:
         if memory.cluster_id:
             self.cluster_search_cache.clear(memory.cluster_id)
         
+        # 使权重缓存失效
+        if memory_id in self.weight_cache:
+            del self.weight_cache[memory_id]
+        
         return True
     
-    # =============== 公共API ===============
+    # =============== 公共API（带缓存更新） ===============
     
     def add_memory(self, content: str, metadata: Dict[str, Any] = None) -> str:
-        """添加新记忆（原子操作），包含重复检测"""
+        """添加新记忆（原子操作），包含重复检测和缓存更新"""
         # 增加轮数
         current_turn = self._increment_turn(self.config.TURN_INCREMENT_ON_ADD)
         
@@ -2355,6 +3143,9 @@ class MemoryModule:
                 json.dumps(memory.metadata)
             ))
             
+            # 更新向量缓存（增量）
+            self.invalidate_vector_cache(memory_id, 'add')
+            
             return memory_id
     
     def access_memory(self, memory_id: str) -> Optional[MemoryItem]:
@@ -2388,6 +3179,10 @@ class MemoryModule:
                 SET last_interaction_turn = ?, access_count = ?, update_count = update_count + 1
                 WHERE id = ?
             """, (memory.last_interaction_turn, memory.access_count, memory_id))
+            
+            # 使权重缓存失效
+            if memory_id in self.weight_cache:
+                del self.weight_cache[memory_id]
             
             return memory
         
@@ -2469,6 +3264,9 @@ class MemoryModule:
                 self.stats['hot_memories'] += 1
                 self.stats['cold_memories'] -= 1
                 
+                # 更新向量缓存
+                self.invalidate_vector_cache(memory_id, 'add')
+                
                 return memory
         
         return None
@@ -2531,6 +3329,10 @@ class MemoryModule:
             # 检查休眠记忆
             if len(self.sleeping_memories) > 0:
                 self._check_and_move_sleeping()
+            
+            # 使缓存失效
+            self.weight_cache.clear()
+            self.invalidate_vector_cache()
     
     # =============== 辅助方法 ===============
     
@@ -2686,6 +3488,9 @@ class MemoryModule:
                 # 更新统计
                 self.stats['hot_memories'] -= 1
                 self.stats['cold_memories'] += 1
+            
+            # 更新向量缓存
+            self.invalidate_vector_cache()
     
     def _vector_to_blob(self, vector: np.ndarray) -> bytes:
         """向量转换为二进制"""
@@ -2716,6 +3521,55 @@ class MemoryModule:
             cluster.id
         ))
         cluster.version += 1
+    
+    # =============== 缓存统计和管理 ===============
+    
+    def get_cache_stats(self) -> Dict[str, Any]:
+        """获取缓存统计信息"""
+        with self.vector_cache_lock:
+            vector_cache_stats = {
+                'is_valid': self.vector_cache.is_valid,
+                'size': len(self.vector_cache.memory_ids) if self.vector_cache.memory_ids else 0,
+                'last_updated': self.vector_cache.last_updated,
+                'age_seconds': time.time() - self.vector_cache.last_updated if self.vector_cache.last_updated > 0 else 0
+            }
+        
+        similarity_cache_stats = self.similarity_cache.get_stats()
+        
+        return {
+            'vector_cache': vector_cache_stats,
+            'similarity_cache': similarity_cache_stats,
+            'weight_cache': {
+                'size': len(self.weight_cache),
+                'last_updated_turn': self.weight_cache_turn,
+                'age_turns': self.current_turn - self.weight_cache_turn
+            },
+            'cluster_search_cache': {
+                'size': len(self.cluster_search_cache.cache),
+                'access_turns_size': len(self.cluster_search_cache.access_turns)
+            },
+            'memory_stats': {
+                'hot_memories': len(self.hot_memories),
+                'normalized_vectors_precomputed': self._normalized_vectors is not None,
+                'memory_norms_precomputed': self._precomputed_memory_norms is not None
+            }
+        }
+    
+    def clear_all_caches(self):
+        """清除所有缓存（用于调试）"""
+        with self.vector_cache_lock:
+            self.vector_cache.is_valid = False
+            self.vector_cache.vectors = None
+            self.vector_cache.memory_ids = None
+        
+        self.similarity_cache.cache.clear()
+        self.weight_cache.clear()
+        self.cluster_search_cache.clear()
+        
+        self._normalized_vectors = None
+        self._precomputed_memory_norms = None
+        
+        print("[Cache] All caches cleared")
     
     def get_stats(self) -> Dict[str, Any]:
         """获取系统统计信息"""
@@ -2755,6 +3609,9 @@ class MemoryModule:
                 'cluster_heat_history_size': sum(len(history) for history in self.cluster_heat_history.values()),
             })
         
+        # 获取缓存统计
+        cache_stats = self.get_cache_stats()
+        
         stats.update({
             'memory_addition_count': self.memory_addition_count,
             'operation_count': self.operation_count,
@@ -2772,9 +3629,11 @@ class MemoryModule:
             'duplicate_skipped': self.duplicate_skipped_count,
             'current_turn': self.current_turn,
             'access_frequency_stats_size': len(self.access_frequency_stats),
-            'cluster_search_cache_size': len(self.cluster_search_cache.cache),
+            'cluster_search_cache_size': cache_stats['cluster_search_cache']['size'],
             'cache_hit_rate': (self.stats['cache_hits'] / 
                               max(1, self.stats['cache_hits'] + self.stats['cache_misses'])),
+            'similarity_cache_hit_rate': (self.stats['similarity_cache_hits'] / 
+                                         max(1, self.stats['similarity_cache_hits'] + self.stats['similarity_cache_misses'])),
             'weight_config': {
                 'access_frequency_threshold': self.config.ACCESS_FREQUENCY_DISCOUNT_THRESHOLD,
                 'access_frequency_discount_factor': self.config.ACCESS_FREQUENCY_DISCOUNT_FACTOR,
@@ -2789,7 +3648,14 @@ class MemoryModule:
                 'suppression_factor': self.config.HEAT_SUPPRESSION_FACTOR,
                 'recycle_rate': self.config.HEAT_RECYCLE_RATE,
                 'min_cluster_heat': self.config.MIN_CLUSTER_HEAT_AFTER_RECYCLE
-            }
+            },
+            'layered_search_config': {
+                'enabled': self.config.LAYERED_SEARCH_ENABLED,
+                'fallback': self.config.LAYERED_SEARCH_FALLBACK,
+                'deduplicate': self.config.LAYERED_SEARCH_DEDUPLICATE,
+                'max_total_results': self.config.LAYERED_SEARCH_MAX_TOTAL_RESULTS
+            },
+            'cache_stats': cache_stats
         })
         return stats
     
@@ -2804,6 +3670,14 @@ class MemoryModule:
         if self.memory_addition_count > 0:
             self._create_checkpoint()
         
+        # 输出缓存统计
+        cache_stats = self.get_cache_stats()
+        print(f"[Cache] Final cache statistics:")
+        print(f"  Vector cache: {cache_stats['vector_cache']['size']} vectors")
+        print(f"  Similarity cache: {cache_stats['similarity_cache']['size']} entries")
+        print(f"  Weight cache: {cache_stats['weight_cache']['size']} entries")
+        print(f"  Cluster search cache: {cache_stats['cluster_search_cache']['size']} entries")
+        
         # 关闭后台执行器
         self.background_executor.shutdown(wait=True)
         
@@ -2817,157 +3691,82 @@ class MemoryModule:
         stats = self.get_stats()
         for key, value in stats.items():
             if isinstance(value, (int, float)) and value > 0:
-                print(f"  {key}: {value}")
+                if key == 'cache_stats':
+                    print(f"  {key}:")
+                    for cat, cat_stats in value.items():
+                        print(f"    {cat}:")
+                        for k, v in cat_stats.items():
+                            print(f"      {k}: {v}")
+                else:
+                    print(f"  {key}: {value}")
 
 
-def example_usage():
-    """示例用法"""
-    # 初始化内存模块（使用外部嵌入函数）
-    def custom_embedding(text: str) -> np.ndarray:
-        # 这里可以使用任何嵌入模型
-        from sentence_transformers import SentenceTransformer
-        model = SentenceTransformer("all-MiniLM-L6-v2")
-        return model.encode(text, show_progress_bar=False)
-    
-    def custom_similarity(vec1: np.ndarray, vec2: np.ndarray) -> float:
-        norm1 = np.linalg.norm(vec1)
-        norm2 = np.linalg.norm(vec2)
-        if norm1 == 0 or norm2 == 0:
-            return 0.0
-        return float(np.dot(vec1, vec2) / (norm1 * norm2))
-    
-    # 使用外部嵌入函数初始化
-    memory_module = MemoryModule(
-        embedding_func=custom_embedding,
-        similarity_func=custom_similarity
-    )
-    
-    print(f"Initial turn: {memory_module.get_current_turn()}")
-    
-    # 添加记忆
-    memory_id = memory_module.add_memory("今天天气真好，适合出去散步")
-    print(f"Added memory: {memory_id}, Current turn: {memory_module.get_current_turn()}")
-    
-    # 访问记忆
-    memory = memory_module.access_memory(memory_id)
-    if memory:
-        print(f"Accessed memory: {memory.content}")
-        print(f"Created turn: {memory.created_turn}, Last interaction turn: {memory.last_interaction_turn}")
-        print(f"Update count: {memory.update_count}")
-    
-    # 测试簇内搜索
-    results = memory_module.search_within_cluster(
-        query_text="天气和散步",
-        max_results=5
-    )
-    
-    print(f"\nSearch results:")
-    for i, result in enumerate(results):
-        print(f"{i+1}. {result.memory.content[:30]}... (Score: {result.final_score:.4f})")
-        print(f"   Base similarity: {result.base_similarity:.4f}, Relative heat weight: {result.relative_heat_weight:.4f}")
-        print(f"   Access frequency weight: {result.access_frequency_weight:.4f}, Recency weight: {result.recency_weight:.4f}")
-    
-    # 获取统计
-    stats = memory_module.get_stats()
-    print(f"\nCurrent turn: {stats['current_turn']}")
-    print(f"Hot memories: {stats['hot_memories_count']}")
-    print(f"Heat distribution - Top 3: {stats.get('top3_heat_ratio', 0):.2%}, Top 5: {stats.get('top5_heat_ratio', 0):.2%}")
-    
-    # 清理
-    memory_module.cleanup()
-
-
-def advanced_example_usage():
-    """高级示例用法，展示基于轮数的时间系统和热力分布控制"""
+# =============== 示例用法 ===============
+def example_layered_search():
+    """示例：使用分层搜索"""
     # 初始化内存模块
     memory_module = MemoryModule()
     
-    print(f"Initial turn: {memory_module.get_current_turn()}")
-    
-    # 添加一些示例记忆
-    sample_memories = [
-        "机器学习是人工智能的重要分支",
-        "深度学习需要大量的计算资源",
-        "自然语言处理让计算机理解人类语言",
-        "卷积神经网络在图像识别中表现出色",
-        "Transformer模型彻底改变了自然语言处理",
-        "强化学习通过试错来学习最优策略",
-        "生成对抗网络可以创造逼真的图像",
-        "迁移学习利用已有知识解决新问题",
-        "自监督学习不需要人工标注的数据",
-        "联邦学习保护用户隐私的同时进行训练"
+    # 添加一些测试记忆
+    test_memories = [
+        "机器学习是人工智能的重要分支，用于模式识别和预测",
+        "深度学习需要大量的计算资源，尤其是GPU",
+        "自然语言处理让计算机理解人类语言，包括情感分析",
+        "卷积神经网络在图像识别中表现出色，用于分类和检测",
+        "Transformer模型彻底改变了自然语言处理的范式",
+        "强化学习通过试错来学习最优策略，用于游戏和机器人",
+        "生成对抗网络可以创造逼真的图像，用于艺术创作",
+        "迁移学习利用已有知识解决新问题，提高学习效率",
+        "自监督学习不需要人工标注的数据，降低成本",
+        "联邦学习保护用户隐私的同时进行模型训练"
     ]
     
-    memory_ids = []
-    for content in sample_memories:
+    print("Adding test memories...")
+    for content in test_memories:
         memory_id = memory_module.add_memory(content)
-        memory_ids.append(memory_id)
-        print(f"Added memory at turn {memory_module.get_current_turn()}: {content[:30]}...")
+        print(f"  Added: {content[:30]}...")
     
-    # 模拟多次访问某些记忆，创建热力集中的簇
-    print(f"\nSimulating memory accesses to create heat concentration...")
-    for i in range(10):
-        # 频繁访问前3个记忆，使其所在簇获得更多热力
-        for j in range(0, min(3, len(memory_ids))):
-            memory_module.access_memory(memory_ids[j])
-            print(f"Turn {memory_module.get_current_turn()}: Accessed memory {memory_ids[j][:8]}...")
-    
-    # 手动触发维护任务以检查热力分布
-    print(f"\nForcing maintenance to check heat distribution...")
-    memory_module.operation_count = memory_module.MAINTENANCE_OPERATION_THRESHOLD  # 触发维护
-    memory_module._trigger_maintenance_if_needed()
-    
-    time.sleep(2)  # 等待维护任务完成
-    
-    # 获取簇统计信息
-    cluster_ids = set()
-    for memory_id in memory_ids:
-        memory = memory_module.access_memory(memory_id)
-        if memory and memory.cluster_id:
-            cluster_ids.add(memory.cluster_id)
-    
-    for cluster_id in list(cluster_ids)[:3]:  # 只显示前3个簇
-        cluster_stats = memory_module.get_cluster_statistics(cluster_id)
-        print(f"\nCluster statistics for {cluster_id}:")
-        print(f"Current turn: {cluster_stats['current_turn']}")
-        print(f"Memory count: {cluster_stats['memory_count']}")
-        print(f"Total heat: {cluster_stats['total_heat']}")
-        
-        if cluster_stats['heat_distribution']:
-            print("\nHeat distribution:")
-            for i, mem in enumerate(cluster_stats['heat_distribution'][:3]):
-                print(f"  {i+1}. ID: {mem['memory_id'][:8]}..., Heat: {mem['heat']}")
-                print(f"     Last interaction: {mem['last_interaction_turn']} "
-                      f"(Turns since: {mem['turns_since_interaction']})")
-                print(f"     Access frequency weight: {mem['access_frequency_weight']:.4f}")
-    
-    # 测试加权搜索
-    print(f"\n\nTesting weighted search...")
+    # 测试分层搜索
     query = "人工智能和机器学习"
-    results = memory_module.search_within_cluster(
-        query_text=query,
-        max_results=3
-    )
     
-    for i, result in enumerate(results):
-        print(f"{i+1}. {result.memory.content[:40]}...")
-        print(f"   Final score: {result.final_score:.4f}")
-        print(f"   Access frequency weight: {result.access_frequency_weight:.4f}")
-        print(f"   Recency weight: {result.recency_weight:.4f}")
-        print(f"   Last interaction turn: {result.memory.last_interaction_turn}")
+    print(f"\nSearching for: '{query}'")
+    print("=" * 60)
     
-    # 获取系统统计
+    # 获取分层搜索结果
+    layered_results = memory_module.search_layered_memories(query_text=query)
+    
+    # 显示各层结果
+    total_results = 0
+    for layer_name, layer_result in layered_results.items():
+        sim_min, sim_max = layer_result.similarity_range
+        print(f"\n{layer_name.upper()}: Similarity {sim_min:.2f}-{sim_max:.2f}")
+        print(f"  Target: {layer_result.target_count}, Achieved: {layer_result.achieved_count}")
+        print(f"  Avg Similarity: {layer_result.avg_similarity:.4f}, Avg Score: {layer_result.avg_final_score:.4f}")
+        
+        for i, result in enumerate(layer_result.results):
+            print(f"    {i+1}. {result.memory.content[:40]}...")
+            print(f"       Similarity: {result.base_similarity:.4f}, Final Score: {result.final_score:.4f}")
+            print(f"       Heat: {result.memory.heat}, Access Count: {result.memory.access_count}")
+        
+        total_results += len(layer_result.results)
+    
+    print(f"\nTotal results across all layers: {total_results}")
+    
+    # 获取扁平化结果
+    print(f"\nFlattened results:")
+    flattened = memory_module.get_layered_search_results(query_text=query, flatten_results=True)
+    for i, result in enumerate(flattened):
+        print(f"{i+1}. [{result.memory.cluster_id[:8]}] {result.memory.content[:50]}...")
+        print(f"   Similarity: {result.base_similarity:.4f}, Score: {result.final_score:.4f}")
+    
+    # 显示统计信息
+    print(f"\nSystem statistics:")
     stats = memory_module.get_stats()
-    print(f"\n\nFinal system statistics:")
     print(f"Current turn: {stats['current_turn']}")
-    print(f"Total operations: {stats['operation_count']}")
-    print(f"Cache hits: {stats['cache_hits']}, Misses: {stats['cache_misses']}")
-    print(f"High frequency memories: {stats['high_frequency_memories']}")
-    print(f"Heat distribution - Top 3: {stats.get('top3_heat_ratio', 0):.2%}, Top 5: {stats.get('top5_heat_ratio', 0):.2%}")
-    print(f"Heat redistributions: {stats.get('heat_redistributions', 0)}")
-    print(f"Heat recycled to pool: {stats.get('heat_recycled_to_pool', 0)}")
-    print(f"In suppression period: {stats.get('in_suppression_period', False)}")
-    print(f"Suppression factor: {stats.get('suppression_factor', 1.0):.2f}")
+    print(f"Hot memories: {stats['hot_memories_count']}")
+    print(f"Layered searches: {stats['layered_searches']}")
+    print(f"Vectorized searches: {stats['vectorized_searches']}")
+    print(f"Similarity cache hits: {stats['similarity_cache_hits']}, misses: {stats['similarity_cache_misses']}")
     
     # 清理
     memory_module.cleanup()
@@ -2975,11 +3774,6 @@ def advanced_example_usage():
 
 if __name__ == "__main__":
     print("="*80)
-    print("Basic example usage:")
+    print("Layered search example with NumPy vectorization:")
     print("="*80)
-    example_usage()
-    
-    print("\n" + "="*80)
-    print("Advanced example usage with turn-based time system and heat distribution control:")
-    print("="*80)
-    advanced_example_usage()
+    example_layered_search()

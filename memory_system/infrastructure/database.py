@@ -92,6 +92,18 @@ class Database:
                 retry_count INTEGER DEFAULT 0
             )
         """)
+        
+        self.cursor.execute(f"""
+            CREATE TABLE IF NOT EXISTS {self.config.WAYPOINT_TABLE} (
+                source_id TEXT,
+                target_id TEXT,
+                weight REAL DEFAULT 0.5,
+                created_turn INTEGER DEFAULT 0,
+                last_updated_turn INTEGER DEFAULT 0,
+                PRIMARY KEY (source_id, target_id)
+            )
+        """)
+        self.cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_waypoint_source ON {self.config.WAYPOINT_TABLE}(source_id)")
 
         # 新增：暂存热力表
         self.cursor.execute(f"""

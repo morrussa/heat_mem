@@ -98,3 +98,11 @@ class PendingHeat:
     pending_heat: int
     version: int = 1
     last_updated_turn: int = 0
+
+@dataclass
+class WaypointEdge:
+    source_id: str
+    target_id: str
+    weight: float
+    created_turn: int
+    last_updated_turn: int

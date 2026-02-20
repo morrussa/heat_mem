@@ -4,6 +4,8 @@
 
 默认**main.py**搭载了一个名为mori的agent。没别的意思，单纯提醒你再真实，它也是死的。
 
+这个readme由deepseek生成，我承认我懒得写。
+
 ---
 
 ## ✨ 核心特性
@@ -50,8 +52,8 @@ pip install -r requirements.txt
 **依赖**：  
 - Python ≥ 3.8  
 - numpy  
-- annoy（可选，用于加速簇检索）  
-- sentence-transformers（可选，用于生成向量，也可自定义嵌入函数）
+- annoy
+- sentence-transformers
 
 ### 2. 初始化记忆模块
 

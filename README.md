@@ -145,7 +145,7 @@ config.LAYERED_SEARCH_MAX_TOTAL_RESULTS = 10
 mem = MemoryModule(config=config)
 ```
 
-详细配置项请参见 [config.py](heat_mem/config.py)。
+详细配置项请参见 [config.py](memory_system/config.py)。
 
 ---
 

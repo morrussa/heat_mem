@@ -209,8 +209,15 @@ HeatMem的设计借鉴了openMemory项目的waypoint联想图。
 
 所以我完全放弃了记忆压缩和修剪，因为在我的认知中，任何形式的压缩都是对过去的背叛。所以我们不能要求LLM有自知力，论据：LLM（除diffusionLLM）只是单纯预测下一个token,如果让它自组织，即将记忆作为了LLM权重的附属品。如果你真的希望它活过来，那么就不应该指望死权重。
 
+
+
+**它的搜索过程如下：**
+1.向量空间内只储存原子事实，top-k原子事实储存其对应的记忆trun号
+2.通过trun号展开，用倒排索引的方式对trun号进行打分。选出top-k具体记忆。
+3.用具体记忆进入联想图。
+
 这个readme由大体上deepseek生成，我承认我懒得写。
 
 ---
 
-**让 Mori 记住每一次对话，成为更懂你的 AI。**
+**Real long-term memory for AI agents. Not a vector DB. Not just RAG. Self-hosted**

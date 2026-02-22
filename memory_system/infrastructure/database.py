@@ -1,3 +1,4 @@
+# database.py
 import sqlite3
 import json
 from typing import Optional, Any
@@ -11,7 +12,7 @@ class Database:
         self.config = config
         self.conn = None
         self.cursor = None
-        self._init_database()  # 这行会调用下面的方法
+        self._init_database()
 
     def _init_database(self):
         """初始化数据库表结构"""
@@ -21,8 +22,8 @@ class Database:
         self.conn.execute("PRAGMA synchronous=NORMAL")
         self.conn.row_factory = sqlite3.Row
         
-        # 然后创建游标
-        self.cursor = self.conn.cursor()  # 这行是关键！
+        # 创建游标
+        self.cursor = self.conn.cursor()
         
         # 创建表
         # 记忆表
@@ -93,6 +94,7 @@ class Database:
             )
         """)
         
+        # 联想图（Waypoint）表
         self.cursor.execute(f"""
             CREATE TABLE IF NOT EXISTS {self.config.WAYPOINT_TABLE} (
                 source_id TEXT,
@@ -105,14 +107,20 @@ class Database:
         """)
         self.cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_waypoint_source ON {self.config.WAYPOINT_TABLE}(source_id)")
 
-        # 新增：暂存热力表
+        # 新增：暂存热力单元表（替代旧的 pending_heat 表）
         self.cursor.execute(f"""
-            CREATE TABLE IF NOT EXISTS {self.config.PENDING_HEAT_TABLE} (
-                cluster_id TEXT PRIMARY KEY,
-                pending_heat INTEGER DEFAULT 0,
-                version INTEGER DEFAULT 1,
-                last_updated_turn INTEGER DEFAULT 0
+            CREATE TABLE IF NOT EXISTS {self.config.PENDING_HEAT_UNITS_TABLE} (
+                id TEXT PRIMARY KEY,
+                vector BLOB NOT NULL,
+                pending_heat INTEGER NOT NULL,
+                created_turn INTEGER NOT NULL,
+                status TEXT DEFAULT 'pending',
+                version INTEGER DEFAULT 1
             )
+        """)
+        self.cursor.execute(f"""
+            CREATE INDEX IF NOT EXISTS idx_pending_units_status 
+            ON {self.config.PENDING_HEAT_UNITS_TABLE}(status)
         """)
 
         # 索引
@@ -121,7 +129,6 @@ class Database:
         self.cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_memory_cluster ON {self.config.MEMORY_TABLE}(cluster_id, heat)")
         self.cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_memory_hot_heat ON {self.config.MEMORY_TABLE}(is_hot, heat DESC)")
         self.cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_memory_turn ON {self.config.MEMORY_TABLE}(last_interaction_turn DESC)")
-        self.cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_pending_heat_turn ON {self.config.PENDING_HEAT_TABLE}(last_updated_turn)")
 
         # 初始化热力池记录
         self.cursor.execute(f"""

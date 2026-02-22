@@ -92,12 +92,12 @@ class VectorCache:
     last_updated: float = 0
     is_valid: bool = False
     
-@dataclass
-class PendingHeat:
-    cluster_id: str
-    pending_heat: int
-    version: int = 1
-    last_updated_turn: int = 0
+# @dataclass
+# class PendingHeat:
+#     cluster_id: str
+#     pending_heat: int
+#     version: int = 1
+#     last_updated_turn: int = 0
 
 @dataclass
 class WaypointEdge:
@@ -106,3 +106,12 @@ class WaypointEdge:
     weight: float
     created_turn: int
     last_updated_turn: int
+
+@dataclass
+class PendingHeatUnit:
+    id: str                          # 新记忆的ID（也是主键）
+    vector: np.ndarray                # 新记忆的向量
+    pending_heat: int                 # 暂存的热力值
+    created_turn: int                 # 创建时的轮数
+    status: str = "pending"           # 状态：pending / processing / done
+    version: int = 1

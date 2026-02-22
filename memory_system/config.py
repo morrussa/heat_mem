@@ -165,8 +165,10 @@ class Config:
     HISTORY_MAX_DISK_RECORDS = 1000000
     
     # 在 Config 类中添加
-    PENDING_HEAT_TABLE = "pending_heat"  # 暂存热力表名
+    # PENDING_HEAT_TABLE = "pending_heat"  # 暂存热力表名
     PENDING_HEAT_CACHE_TTL = 100  # 暂存热力缓存 TTL（轮数）
+
+    PENDING_HEAT_UNITS_TABLE = "pending_heat_units"
     
     
 

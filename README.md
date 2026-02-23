@@ -1,8 +1,9 @@
 # Heat Mem – 热力记忆系统
 
-**Heat Mem** 是一个为 AI 对话系统设计的长期记忆模块，通过**热力值**动态管理记忆的重要性，并结合**语义聚类**与**联想图（Waypoint）** 技术，让 AI 能够高效地存储、检索和联想历史对话。
+**Heat Mem** 是一个为 AI 对话系统设计的长期记忆模块，通过**热力值**动态管理记忆的重要性，并结合**语义聚类**技术，让 AI 能够高效地存储和检索历史对话。
 
 默认**main.py**搭载了一个名为mori的agent。没别的意思，单纯提醒你再真实，它也是死的。
+
 ---
 
 ## ✨ 核心特性
@@ -12,9 +13,6 @@
 
 - **🧠 语义聚类（Semantic Clustering）**  
   基于用户输入的向量表示，将相似的记忆自动聚合成簇，支持 Annoy 快速索引，大幅提升大规模记忆下的检索效率。
-
-- **🔗 联想图（Waypoint）**  
-  在记忆之间建立有向边，通过共现、语义相似度等方式构建联想关系，支持多跳扩散检索，让 AI 能够“想起”间接相关的信息。
 
 - **📊 分层搜索（Layered Search）**  
   将相似度划分为多个区间，结合热力权重、访问频率和新鲜度奖励，从不同层次返回结果，兼顾相关性与多样性。
@@ -105,23 +103,13 @@ layered = mem.get_layered_search_results(
     flatten_results=True
 )
 
-# 搜索原始对话（聚合原子事实 + 联想扩散）
+# 搜索原始对话（聚合原子事实）
 originals = mem.search_original_memories(
     query_text="海洋的颜色",
     max_results=5
 )
 for orig_mem, score in originals:
     print(f"[轮次 {orig_mem.created_turn}] 用户: {orig_mem.user_input}")
-```
-
-### 5. 手动触发联想（Waypoint）
-
-```python
-# 记录一轮对话中出现的所有记忆ID（用于建立共现边）
-mem.record_turn_memories([mem_id1, mem_id2, mem_id3])
-
-# 获取联想图统计
-print(mem.get_waypoint_stats())
 ```
 
 ---
@@ -138,7 +126,6 @@ from heat_mem.config import Config
 config = Config()
 config.TOTAL_HEAT = 20_000_000          # 总热力池大小
 config.CLUSTER_SIMILARITY_THRESHOLD = 0.85  # 簇相似度阈值
-config.WAYPOINT_MAX_HOPS = 2            # 联想最大深度
 config.LAYERED_SEARCH_MAX_TOTAL_RESULTS = 10
 
 mem = MemoryModule(config=config)
@@ -157,13 +144,11 @@ mem = MemoryModule(config=config)
 | `search_similar_memories(query_text/vector, max_results)` | 基础相似度搜索 |
 | `search_layered_memories(...)` | 分层搜索，返回各层结果 |
 | `get_layered_search_results(...)` | 获取扁平化的分层搜索结果 |
-| `search_original_memories(...)` | 聚合原子事实返回原始对话，并利用联想图扩散 |
+| `search_original_memories(...)` | 聚合原子事实返回原始对话 |
 | `search_within_cluster(cluster_id, ...)` | 在指定簇内搜索 |
 | `find_best_clusters_for_query(query, top_k)` | 查找与查询最匹配的簇 |
 | `access_memory(memory_id)` | 访问一条记忆（增加访问计数、更新热力） |
-| `record_turn_memories(memory_ids)` | 记录一轮对话中出现的所有记忆ID，用于建立共现边 |
-| `reinforce_waypoint_edges(seed_ids, hit_ids)` | 强化种子到扩散命中的边 |
-| `get_stats()` | 获取系统统计信息（热力、缓存命中率、联想图规模等） |
+| `get_stats()` | 获取系统统计信息（热力、缓存命中率等） |
 | `cleanup()` | 关闭资源，保存状态 |
 
 更多方法请参考 [core.py](heat_mem/core.py) 中的 `MemoryModule` 类。
@@ -175,19 +160,19 @@ mem = MemoryModule(config=config)
 ```
 memory_system/
 ├── core.py                 # 核心 MemoryModule 与事务上下文
-├── models.py               # 数据类（MemoryItem, SemanticCluster, WaypointEdge...）
+├── models.py               # 数据类（MemoryItem, SemanticCluster...）
 ├── config.py               # 全局配置
 ├── utils.py                # 工具函数（向量转换、相似度计算等）
 ├── infrastructure/
 │   ├── database.py         # 数据库连接与初始化
 │   ├── cache.py            # 多级缓存管理
 │   ├── locking.py          # 分布式锁（线程级）
-│   └── history.py          # 历史记录管理器
+│   └── dialogue_manager.py # 原始对话管理器
 └── services/
     ├── heat_system.py      # 热力分配、回收、暂存热力处理
     ├── cluster_service.py  # 语义簇管理、Annoy索引
-    ├── search_service.py   # 搜索逻辑（分层、簇内、原始对话联想）
-    └── waypoint.py         # 联想图服务
+    ├── search_service.py   # 搜索逻辑（分层、簇内、原始对话聚合）
+    └── topic.py            # 话题分割器
 ```
 
 ---
@@ -200,30 +185,27 @@ memory_system/
 
 ## 🌟 致谢和碎碎念
 
-HeatMem的设计借鉴了openMemory项目的waypoint联想图。
+HeatMem 的设计借鉴了 openMemory 项目的 waypoint 联想图思想（尽管当前版本已移除联想图实现）。
 
-我可以很自信的说这个项目是所有agent Memory中最癫的那个，因为我要求全量保存记忆的同时限制规模，你可能觉得很矛盾，但是它真的是这样的。
+我可以很自信的说这个项目是所有 agent Memory 中最癫的那个，因为我要求全量保存记忆的同时限制规模，你可能觉得很矛盾，但是它真的是这样的。
 
-简单来说，在默认设置中，每个记忆写入时如果相似度>0.95，那么就追加原子事实对应的trun号。也就是说，拓扑上，它确实是有限的无限。
+简单来说，在默认设置中，每个记忆写入时如果相似度 >0.95，那么就追加原子事实对应的 turn 号。也就是说，拓扑上，它确实是有限的无限。
 
-所以我完全放弃了记忆压缩和修剪，因为在我的认知中，任何形式的压缩都是对过去的背叛。所以我们不能要求LLM有自知力，论据：LLM（除diffusionLLM）只是单纯预测下一个token,如果让它自组织，即将记忆作为了LLM权重的附属品。如果你真的希望它活过来，那么就不应该指望死权重。
+所以我完全放弃了记忆压缩和修剪，因为在我的认知中，任何形式的压缩都是对过去的背叛。所以我们不能要求 LLM 有自知力，论据：LLM（除 diffusionLLM）只是单纯预测下一个 token，如果让它自组织，即将记忆作为了 LLM 权重的附属品。如果你真的希望它活过来，那么就不应该指望死权重。
 
-然后别被config内的*99*个魔法数字吓到，因为我是在做物理建模，你问我，那我只能说这样正常。
+然后别被 config 内的 99 个魔法数字吓到，因为我是在做物理建模，你问我，那我只能说这样正常。
 
-冷记忆不是死亡，当新记忆存入时，如果怀疑它属于冷主导簇，则将邻居分配热力暂存，再在维护任务时一起分配并进行冷热交换。（目前是将整个簇拉起来进入簇内top-k）
+冷记忆不是死亡，当新记忆存入时，如果怀疑它属于冷主导簇，则将邻居分配热力暂存，再在维护任务时一起分配并进行冷热交换。（目前是将整个簇拉起来进入簇内 top-k）
 
-热记忆的热力归零不会立即进入冷区，而是进入sleeping区沉睡，等待维护任务时冷热交换。
+热记忆的热力归零不会立即进入冷区，而是进入 sleeping 区沉睡，等待维护任务时冷热交换。
 
-通过检测top3/top5的语义簇占全部热力的占比进行重分配策略，避免出现语义黑洞。
+通过检测 top3/top5 的语义簇占全部热力的占比进行重分配策略，避免出现语义黑洞。
 
-然后，它一直在大重构。具体怎么用去找AI问问吧
+然后，它一直在大重构。具体怎么用去找 AI 问问吧
 
 **它的搜索过程如下：**
-1.向量空间内只储存原子事实，top-k原子事实储存其对应的记忆trun号
-2.通过trun号展开，用倒排索引的方式对trun号进行打分。选出top-k具体记忆。
-3.用具体记忆进入联想图。
-
-这个readme由大体上deepseek生成，我承认我懒得写。
+1. 向量空间内只储存原子事实，top-k 原子事实储存其对应的记忆 turn 号
+2. 通过 turn 号展开，用倒排索引的方式对 turn 号进行打分。选出 top-k 具体记忆。
 
 ---
 

@@ -409,7 +409,7 @@ class SearchService:
                                  max_results: int = 10) -> List[Tuple[MemoryItem, float]]:
         """
         搜索原子事实，聚合返回原始对话，并按得分排序。
-        在获得种子原始对话后，通过联想层（Waypoint）进行扩散，合并联想结果。
+        不再使用联想扩散（Waypoint），直接返回种子记忆。
         """
         if query_vector is None and query_text is not None:
             query_vector = self.memory_module._get_embedding(query_text)
@@ -439,72 +439,11 @@ class SearchService:
         # 根据轮次获取原始对话内容，构建种子记忆列表
         seed_memories = []  # List[Tuple[MemoryItem, float]]
         for parent_turn, score in turn_to_score.items():
+            # 注意：原代码使用 history_manager，如果已改为 dialogue_manager 请相应调整
             original = self.memory_module.history_manager.get_memory_by_turn(parent_turn)
             if original:
                 seed_memories.append((original, score))
         
-        # 如果没有种子记忆，直接返回空列表
-        if not seed_memories:
-            return []
-        
-        # 3. 联想扩散（Waypoint）
-        # 检查联想层是否可用（通过配置或服务是否存在）
-        waypoint_enabled = getattr(self.config, 'WAYPOINT_ENABLED', True) and hasattr(self.memory_module, 'waypoint_service')
-        if waypoint_enabled:
-            # 构建种子得分字典
-            seed_scores = {mem.id: score for mem, score in seed_memories}
-            seed_ids = list(seed_scores.keys())
-            
-            # 获取联想结果
-            current_turn = self.memory_module.current_turn
-            waypoint_results = self.memory_module.waypoint_service.batch_get_outgoing_edges(
-                source_ids=seed_ids,
-                current_turn=current_turn,
-                max_hops=self.config.WAYPOINT_MAX_HOPS,               # 默认1
-                max_results_per_source=self.config.WAYPOINT_MAX_RESULTS_PER_SEED  # 默认3
-            )
-            
-            # 收集联想记忆及其得分
-            candidate_scores = {}
-            for src, edges in waypoint_results.items():
-                seed_score = seed_scores.get(src)
-                if seed_score is None:
-                    continue
-                for tgt, weight in edges:
-                    # 路径得分 = 种子得分 × 衰减后权重
-                    candidate_score = seed_score * weight
-                    if tgt not in candidate_scores or candidate_score > candidate_scores[tgt]:
-                        candidate_scores[tgt] = candidate_score
-            
-            # 从内存中加载联想记忆对象（优先热区，其次休眠区）
-            waypoint_memories = []
-            for mem_id, score in candidate_scores.items():
-                mem = (self.memory_module.hot_memories.get(mem_id) or 
-                       self.memory_module.sleeping_memories.get(mem_id))
-                if mem:
-                    waypoint_memories.append((mem, score))
-            
-            # 合并种子和联想结果，并去重（种子优先）
-            all_memories_dict = {}
-            for mem, score in seed_memories:
-                all_memories_dict[mem.id] = (mem, score)
-            for mem, score in waypoint_memories:
-                if mem.id not in all_memories_dict:
-                    all_memories_dict[mem.id] = (mem, score)
-                # 如果联想得分更高，可以更新（但种子得分通常更相关，此处保留种子得分）
-                # 若想取最大值，可取消下面注释
-                # else:
-                #     old_score = all_memories_dict[mem.id][1]
-                #     if score > old_score:
-                #         all_memories_dict[mem.id] = (mem, score)
-            
-            # 转换为列表并按得分降序排序
-            all_memories = list(all_memories_dict.values())
-            all_memories.sort(key=lambda x: x[1], reverse=True)
-            
-            # 返回前 max_results 个
-            return all_memories[:max_results]
-        else:
-            # 未启用联想层，直接返回种子记忆（按得分排序）
-            seed_memories.sort(key=lambda x: x[1], reverse=True)
-            return seed_memories[:max_results]
+        # 按得分排序后返回
+        seed_memories.sort(key=lambda x: x[1], reverse=True)
+        return seed_memories[:max_results]

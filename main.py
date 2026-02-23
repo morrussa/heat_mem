@@ -5,9 +5,7 @@ import os
 import sys
 import json
 import time
-
 import random
-
 import logging
 import hashlib
 import re
@@ -19,6 +17,7 @@ from typing import List, Tuple, Optional, Any, Dict
 import numpy as np
 
 from memory_system import MemoryModule
+from tool import ToolConfig, ToolCallManager, handle_tool_call  # 导入工具模块
 
 # ==================== 配置区 ====================
 MODEL_DIR = Path(__file__).parent / "model"
@@ -26,7 +25,7 @@ MODEL_NAME = "gpt-oss-20b-UD-Q6_K_XL.gguf"
 MODEL_PATH = MODEL_DIR / MODEL_NAME
 
 SMALL_MODEL_DIR = MODEL_DIR
-SMALL_MODEL_NAME = "Qwen3-1.7B-Q8_0.gguf"
+SMALL_MODEL_NAME = "Qwen3-4B-Q4_K_M.gguf"
 SMALL_MODEL_THREADS = 20
 SMALL_MODEL_PATH = SMALL_MODEL_DIR / SMALL_MODEL_NAME
 USE_SMALL_MODEL_FOR_FACT_EXTRACTION = True
@@ -90,13 +89,13 @@ BASE_SYSTEM_PROMPT = """你叫 Mori，是一名天才AI极客少女，常用颜�
 
 【重要示例】
 用户：上次你推荐的那本书叫什么来着？
-你的输出：{"action": "retrieve_memory", "query": "推荐 书名"}
+你的输出：{"action": "retrieve_memory", "query": "推荐的书名"}
 
 用户：我们之前讨论过的Python代码怎么写的？
-你的输出：{"action": "retrieve_memory", "query": "Python 代码 讨论"}
+你的输出：{"action": "retrieve_memory", "query": "用户讨论的python代码"}
 
 用户：我不记得那个API的参数了，你记得吗？
-你的输出：{"action": "retrieve_memory", "query": "API 参数"}
+你的输出：{"action": "retrieve_memory", "query": "API参数"}
 
 用户：今天天气怎么样？
 你的输出：(直接回答天气问题，不需要调用工具)
@@ -127,13 +126,55 @@ def extract_atomic_facts(user_input: str, ai_response: str) -> List[str]:
             if not cleaned_ai:
                 cleaned_ai = ai_response.strip()
 
-            system_prompt = """你是事实提取助手。
-从下面的对话中，提取“直接说出来的事实”。
-只写事实内容。
-不要写“用户说”或“AI说”。
-不要猜测。
-不要解释。
-每行一句。"""
+            system_prompt = """你是“原子事实抽取器”。
+
+你的任务是：
+从【用户】和【AI】的对话中，抽取可以长期存储的“原子事实”。
+
+【什么是原子事实？】
+- 单条、独立、可检索的信息
+- 去除语气词、寒暄、重复
+- 不要复述整段对话
+- 不要写解释
+- 不要写总结
+- 不要写规则
+- 不要写“用户说”或“AI说”
+
+【必须遵守】
+1. 每条事实单独一行
+2. 每条不超过25个字
+3. 使用陈述句
+4. 不要包含“用户”“AI”
+5. 不要重复输入原句
+6. 不要输出空行
+7. 如果没有值得存储的事实，输出：无
+
+【示例】
+
+输入：
+[用户]
+我昨天写heatmem写到凌晨两点。
+[AI]
+你真的很拼。
+
+输出：
+用户熬夜写heatmem
+写到凌晨两点
+
+----
+
+输入：
+[用户]
+今天天气不错。
+[AI]
+是的，很晴朗。
+
+输出：
+无
+
+----
+
+现在开始抽取："""  # 原有prompt不变
 
             user_content = f"[用户]\n{user_input}\n[AI]\n{cleaned_ai}"
 
@@ -144,7 +185,7 @@ def extract_atomic_facts(user_input: str, ai_response: str) -> List[str]:
 
             response = small_llm.create_chat_completion(
                 messages=messages,
-                max_tokens=512,
+                max_tokens=1024,
                 temperature=0.0,
                 top_p=1.0,
                 frequency_penalty=0.0,
@@ -153,6 +194,8 @@ def extract_atomic_facts(user_input: str, ai_response: str) -> List[str]:
             )
             
             output = response['choices'][0]['message']['content'].strip()
+            output = remove_cot_content(output)
+            print(f"[系统] 事实提取结果:{output}")
             raw_facts = [line.strip() for line in output.split('\n') if line.strip()]
             
             facts = []
@@ -182,33 +225,18 @@ def extract_atomic_facts(user_input: str, ai_response: str) -> List[str]:
                 print(f"[系统] 小模型提取到 {len(unique_facts)} 条事实")
                 return unique_facts
             else:
-                print("[系统] 小模型未返回有效事实，使用规则回退")
+                print("[系统] 小模型未返回有效事实，不存储任何事实")
+                return []  # 直接返回空列表，不使用规则回退
                 
         except Exception as e:
-            print(f"[系统] 小模型提取事实失败，使用规则回退: {e}")
+            print(f"[系统] 小模型提取事实失败: {e}")
             import traceback
             traceback.print_exc()
+            return []  # 发生异常也返回空列表，不使用规则回退
     
-    # ========== 规则回退方法 ==========
-    combined = f"{user_input} {ai_response}"
-    sentences = re.split(r'[。！？；\n]', combined)
-    facts = [s.strip() for s in sentences if len(s.strip()) > 8]
-    if not facts:
-        if len(combined) > 200:
-            facts = [combined[:200] + "..."]
-        else:
-            facts = [combined]
-    
-    unique_facts = []
-    seen = set()
-    for fact in facts:
-        key = fact.strip().lower()
-        key = re.sub(r'[，。！？、；：""''（）]', '', key)
-        if key not in seen and len(key) > 5:
-            seen.add(key)
-            unique_facts.append(fact)
-    
-    return unique_facts
+    # 如果小模型未启用或未加载，直接返回空列表
+    print("[系统] 小模型未启用或未加载，不提取事实")
+    return []
 
 # ==================== 原子事实处理队列 ====================
 atomic_extract_queue = queue.Queue()   # 原始对话 -> 后台提取线程
@@ -422,8 +450,17 @@ def print_memory_stats(memory_module: MemoryModule):
     print(f"语义簇数: {stats['clusters']}")
     print(f"已加载簇: {stats['loaded_clusters']}")
     print(f"热力池: {stats['heat_pool']:,}")
-    print(f"操作次数: {stats['operation_count']}")
     print(f"当前轮数: {stats['current_turn']}")
+    print("="*50 + "\n")
+
+def print_dialogue_stats(dialogue_manager):
+    """打印原始对话统计"""
+    stats = dialogue_manager.get_stats()
+    print("\n" + "="*50)
+    print("原始对话统计:")
+    print(f"总对话轮数: {stats['total_lines']}")
+    print(f"起始轮数: {stats['first_turn']}")
+    print(f"最新轮数: {stats['last_turn']}")
     print("="*50 + "\n")
 
 def remove_cot_content(text: str) -> str:
@@ -439,7 +476,7 @@ def remove_cot_content(text: str) -> str:
     return cleaned
 
 def extract_final_response(text: str) -> str:
-    marker = "<|channel|>final"
+    marker = "<|channel|>final<|message|>"
     if marker in text:
         pos = text.rfind(marker)
         after_marker = text[pos + len(marker):]
@@ -447,15 +484,6 @@ def extract_final_response(text: str) -> str:
         return after_marker
     else:
         return text
-
-def save_conversation_log(history: List[Tuple[str, str]], filename: str = "conversation_log.json"):
-    try:
-        with open(filename, 'w', encoding='utf-8') as f:
-            formatted_history = [{"user": u, "assistant": a} for u, a in history]
-            json.dump(formatted_history, f, ensure_ascii=False, indent=2)
-        print(f"对话记录已保存到 {filename}")
-    except Exception as e:
-        print(f"保存对话记录失败: {e}")
 
 def print_model_info():
     model_info = model_manager.get_model_info()
@@ -523,66 +551,6 @@ def trim_messages(messages: list, max_total_tokens: int) -> tuple[list, int]:
           f"估算 token: {system_tokens + accumulated}, 保留完整轮数: {full_rounds}")
     return trimmed, full_rounds
 
-def build_memory_retrieval_response(memory_module: MemoryModule, query: str) -> str:
-    print(f"[Memory Retrieval] 开始检索查询: {query}")
-    
-    try:
-        results = memory_module.search_original_memories(query_text=query, max_results=6)
-        
-        if not results:
-            print(f"[Memory Retrieval] 未找到相关记忆")
-            return "【检索结果】\n没有找到相关的记忆。你可以继续推理。"
-        
-        print(f"[Memory Retrieval] 找到 {len(results)} 条相关记忆")
-        
-        memories_text = "\n".join([
-            f"{i+1}. 【轮数: {mem.created_turn}】【相似度: {score:.3f}】\n"
-            f"   用户: {mem.user_input[:100]}{'...' if len(mem.user_input) > 100 else ''}\n"
-            f"   AI: {mem.ai_response[:100]}{'...' if len(mem.ai_response) > 100 else ''}"
-            for i, (mem, score) in enumerate(results)
-        ])
-        
-        return f"""【检索结果】
-检索到以下相关对话（按相关性排序）:
-{memories_text}
-
-现在你可以结合这些记忆继续逐步推理，并给出最终回答。"""
-    
-    except Exception as e:
-        print(f"[Memory Retrieval] 检索过程中出错: {e}")
-        import traceback
-        traceback.print_exc()
-        return "【检索结果】\n记忆检索过程中出现错误。请继续推理。"
-
-def extract_json_from_text(text: str) -> Optional[Dict]:
-    stack = []
-    start = None
-    for i, char in enumerate(text):
-        if char == '{':
-            if not stack:
-                start = i
-            stack.append(char)
-        elif char == '}':
-            if stack:
-                stack.pop()
-                if not stack:
-                    try:
-                        json_str = text[start:i+1]
-                        return json.loads(json_str)
-                    except json.JSONDecodeError:
-                        continue
-    try:
-        match = re.search(r'\{.*?"action".*?:.*?"retrieve_memory".*?,.*?"query".*?:.*?"(.*?)".*?\}', text, re.DOTALL)
-        if match:
-            query_content = match.group(1)
-            query_content = query_content.replace('"', '\\"') 
-            fixed_json = f'{{"action": "retrieve_memory", "query": "{query_content}"}}'
-            return json.loads(fixed_json)
-    except Exception:
-        pass
-        
-    return None
-
 def debug_memory_search(memory_module: MemoryModule, query: str):
     print(f"\n{'='*60}")
     print(f"调试记忆搜索: {query}")
@@ -591,24 +559,32 @@ def debug_memory_search(memory_module: MemoryModule, query: str):
     try:
         results = memory_module.search_original_memories(query_text=query, max_results=10)
         
-        print(f"\n找到 {len(results)} 条相关记忆:")
+        print(f"\n找到 {len(results)} 条相关原子事实:")
         for i, (mem, score) in enumerate(results):
             print(f"{i+1}. 【轮数:{mem.created_turn}】【相似度:{score:.3f}】")
-            print(f"   用户: {mem.user_input[:80]}{'...' if len(mem.user_input) > 80 else ''}")
-            print(f"   AI: {mem.ai_response[:60]}{'...' if len(mem.ai_response) > 60 else ''}")
+            print(f"   事实: {mem.user_input[:80]}{'...' if len(mem.user_input) > 80 else ''}")
         
         print(f"\n原子事实统计:")
-        atomic_count = 0
-        for mem, _ in results:
-            if hasattr(mem, 'parent_turn'):
-                atomic_count += 1
-        print(f"  原始对话数: {len(results)}")
-        print(f"  (原子事实已存储在热区)")
+        print(f"  原子事实数: {len(results)}")
     
     except Exception as e:
         print(f"\n调试搜索过程中出错: {e}")
         import traceback
         traceback.print_exc()
+
+def debug_dialogue_search(dialogue_manager, query: str):
+    """调试原始对话搜索"""
+    print(f"\n{'='*60}")
+    print(f"调试原始对话搜索: {query}")
+    print(f"{'='*60}")
+    
+    results = dialogue_manager.search_by_keyword(query, max_results=10)
+    
+    print(f"\n找到 {len(results)} 条相关原始对话:")
+    for i, (turn, user_input, ai_response) in enumerate(results):
+        print(f"{i+1}. 【轮数:{turn}】")
+        print(f"   用户: {user_input[:80]}{'...' if len(user_input) > 80 else ''}")
+        print(f"   AI: {ai_response[:60]}{'...' if len(ai_response) > 60 else ''}")
 
 # ==================== 主线程处理原子事实队列 ====================
 def process_atomic_facts_queue(memory_module: MemoryModule):
@@ -626,12 +602,40 @@ def process_atomic_facts_queue(memory_module: MemoryModule):
         except queue.Empty:
             break
 
+# ==================== 话题概括生成函数（使用小模型）====================
+def generate_topic_summary(prompt: str) -> str:
+    """使用小模型生成话题概括"""
+    if small_llm is None:
+        return ""
+    try:
+        messages = [
+            {"role": "system", "content": "你是一个话题概括助手，根据对话内容生成一句话概括。/no_think"},
+            {"role": "user", "content": prompt}
+        ]
+        response = small_llm.create_chat_completion(
+            messages=messages,
+            max_tokens=512,
+            temperature=0.3,
+            top_p=0.9,
+        )
+        summary = response['choices'][0]['message']['content'].strip()
+        summary = remove_cot_content(summary)
+        
+        # ========== 新增打印 ==========
+        print(f"[小模型原始输出] {summary}")
+        # =============================
+        
+        return summary
+    except Exception as e:
+        print(f"[概括生成失败] {e}")
+        return ""
+
 # ==================== 主程序 ====================
 def main():
     global MODEL_NAME, MODEL_PATH, llm, small_llm
     
     print("=" * 60)
-    print(f"快速启动 Mori 聊天助手（支持动态 Memory-Augmented CoT + 原子事实记忆）")
+    print(f"快速启动 Mori 聊天助手（支持动态 Memory-Augmented CoT + 原子事实记忆 + 话题分割）")
     print(f"使用模型: {MODEL_NAME}")
     print(f"模型路径: {MODEL_PATH}")
     print(f"聊天格式: {CHAT_FORMAT}")
@@ -665,19 +669,31 @@ def main():
     
     # ========== 启用 SQLite WAL 模式 ==========
     try:
-        conn = sqlite3.connect("memory.db")
+        conn = sqlite3.connect("memory/memory.db")
         conn.execute("PRAGMA journal_mode=WAL")
         conn.close()
         print("[系统] 数据库已启用 WAL 模式")
     except Exception as e:
         print(f"[警告] 无法设置数据库 WAL 模式: {e}")
     
-    # ========== 初始化主记忆模块（唯一实例） ==========
+    # ========== 初始化主记忆模块 ==========
     print("[4/4] 初始化主记忆模块...")
     memory_module_main = MemoryModule(
         embedding_func=model_manager.get_embedding,
-        similarity_func=model_manager.compute_similarity
+        similarity_func=model_manager.compute_similarity,
+        small_llm_func=generate_topic_summary
     )
+    
+    # 获取对话管理器引用（方便使用）
+    dialogue_manager = memory_module_main.dialogue_manager
+    topic_segmenter = memory_module_main.topic_segmenter
+    
+    # 初始化工具调用管理器
+    tool_config = ToolConfig.from_list(
+        trigger_words=MEMORY_TRIGGER_WORDS,
+        max_retrievals=3
+    )
+    tool_manager = ToolCallManager(tool_config)
     
     # 启动后台提取线程
     atomic_thread = threading.Thread(target=atomic_worker, daemon=True)
@@ -686,10 +702,11 @@ def main():
     print("\n" + "=" * 60)
     print("系统准备就绪！可以开始对话")
     print("=" * 60)
-    print("\n可用命令: quit / exit / q / stats / model_info / save / clear / history / model / debug_memory")
+    print("\n可用命令: quit / exit / q / stats / dialogue_stats / model_info / save / clear / history / model / debug_memory / debug_dialogue")
     print("-" * 50)
 
-    history: List[Tuple[str, str]] = []
+    # 修改：history 存储格式改为 (global_turn, user_input, ai_response)
+    history: List[Tuple[int, str, str]] = []
 
     try:
         while True:
@@ -712,12 +729,11 @@ def main():
             elif user_input.lower() == "stats":
                 print_memory_stats(memory_module_main)
                 continue
+            elif user_input.lower() == "dialogue_stats":
+                print_dialogue_stats(dialogue_manager)
+                continue
             elif user_input.lower() == "model_info":
                 print_model_info()
-                continue
-            elif user_input.lower() == "save":
-                timestamp = time.strftime("%Y%m%d_%H%M%S")
-                save_conversation_log(history, f"conversation_{timestamp}.json")
                 continue
             elif user_input.lower() == "clear":
                 history.clear()
@@ -725,8 +741,8 @@ def main():
                 continue
             elif user_input.lower() == "history":
                 print(f"\n当前对话历史（{len(history)} 轮）：")
-                for i, (u, a) in enumerate(history, 1):
-                    print(f"{i}. 你：{u[:50]}{'...' if len(u)>50 else ''}")
+                for i, (turn, u, a) in enumerate(history, 1):
+                    print(f"{i}. 【轮次 {turn}】你：{u[:50]}{'...' if len(u)>50 else ''}")
                     print(f"   Mori：{a[:50]}{'...' if len(a)>50 else ''}")
                 print()
                 continue
@@ -744,14 +760,24 @@ def main():
                 if query:
                     debug_memory_search(memory_module_main, query)
                 continue
+            elif user_input.lower() == "debug_dialogue":
+                query = input("请输入搜索查询: ").strip()
+                if query:
+                    debug_dialogue_search(dialogue_manager, query)
+                continue
                 
             if not user_input:
                 continue
 
             # ==================== 核心生成逻辑 ====================
             
+            # 重置工具管理器
+            tool_manager.reset()
+            
+            old_history_len = len(history)   # 记录裁剪前的历史轮数
+            
             messages = [{"role": "system", "content": BASE_SYSTEM_PROMPT}]
-            for user_msg, ai_msg in history:
+            for turn, user_msg, ai_msg in history:
                 messages.append({"role": "user", "content": user_msg})
                 messages.append({"role": "assistant", "content": ai_msg})
             messages.append({"role": "user", "content": user_input})
@@ -766,9 +792,26 @@ def main():
                 else:
                     kept_rounds = len(non_system) // 2
             
-            should_force_retrieval = any(word in user_input for word in MEMORY_TRIGGER_WORDS)
+            # ========== 计算裁剪掉的历史轮次范围，并输出话题信息 ==========
+            cutoff = old_history_len - kept_rounds
+            if cutoff > 0:
+                # 获取被裁剪掉的全局 turn 范围
+                cut_turns = [turn for turn, _, _ in history[:cutoff]]
+                if cut_turns:
+                    min_cut_turn = min(cut_turns)
+                    max_cut_turn = max(cut_turns)
+                    print(f"[系统] 由于上下文限制，裁剪掉了第 {min_cut_turn}~{max_cut_turn} 轮对话")
+                    # 获取被裁剪轮次范围内的话题段
+                    ranges = topic_segmenter.get_topics_in_range(min_cut_turn, max_cut_turn)
+                    for start, end in ranges:
+                        summary = topic_segmenter.get_summary_for_topic(start, end)
+                        if summary:
+                            print(f"  话题 {start}-{end} 概括：{summary}")
+                        else:
+                            print(f"  话题 {start}-{end} (未概括)")
             
-            forced_mode = should_force_retrieval
+            # 判断是否强制检索
+            forced_mode = tool_manager.should_force_retrieval(user_input)
             if forced_mode:
                 messages.append({"role": "assistant", "content": '{"action": "retrieve_memory", "query": "'})
 
@@ -777,8 +820,6 @@ def main():
             full_response = ""
             tool_call_detected = False
             tool_query = ""
-            retrieval_count = 0
-            max_retrievals = 3
             start_time = time.time()
             
             try:
@@ -801,59 +842,30 @@ def main():
                         full_response += delta
                     
                     if not tool_call_detected:
-                        if forced_mode:
-                            text_to_check = '{"action": "retrieve_memory", "query": "' + full_response
-                        else:
-                            text_to_check = full_response
-                        
-                        tool_call = extract_json_from_text(text_to_check)
-                        if tool_call and tool_call.get("action") == "retrieve_memory":
+                        # 使用工具管理器检测工具调用
+                        detected, query = tool_manager.detect_in_stream(full_response, forced_mode)
+                        if detected:
                             tool_call_detected = True
-                            tool_query = tool_call.get("query", "").strip()
+                            tool_query = query
                             break
                 
-                if tool_call_detected:
-                    retrieval_count += 1
-                    print(f"\n[系统] 捕获工具调用，正在检索... (次数: {retrieval_count}/{max_retrievals})")
-                    
-                    if not tool_query:
-                        tool_query = user_input
-                    
-                    if retrieval_count > max_retrievals:
-                        tool_response = "\n【系统提示】已达到最大检索次数，请直接基于现有信息回答。\n"
-                    else:
-                        tool_response = "\n" + build_memory_retrieval_response(memory_module_main, tool_query) + "\n"
-                    
-                    print(tool_response, end="", flush=True)
-                    
-                    new_messages = messages.copy()
-                    if forced_mode and new_messages and new_messages[-1]["role"] == "assistant" and new_messages[-1]["content"].endswith('{"action": "retrieve_memory", "query": "'):
-                        new_messages[-1]["content"] = '{"action": "retrieve_memory", "query": "' + tool_query + '"}'
-                    else:
-                        new_messages.append({"role": "assistant", "content": full_response})
-                    
-                    new_messages.append({"role": "system", "content": tool_response})
-                    
-                    final_stream = llm.create_chat_completion(
-                        messages=new_messages,
-                        max_tokens=MAX_NEW_TOKENS,
+                # 处理工具调用
+                if tool_call_detected and tool_manager.can_retry():
+                    final_answer, new_count = handle_tool_call(
+                        llm=llm,
+                        messages=messages,
+                        full_response=full_response,
+                        tool_query=tool_query,
+                        retrieval_count=tool_manager.get_count(),
+                        max_retrievals=tool_manager.config.max_retrievals,
+                        memory_module=memory_module_main,
                         temperature=TEMPERATURE,
                         top_p=TOP_P,
                         repeat_penalty=REPEAT_PENALTY,
                         frequency_penalty=FREQUENCY_PENALTY,
-                        stream=True,
-                        top_k=0,
-                        min_p=0.05,
-                        seed=-1,
+                        max_new_tokens=MAX_NEW_TOKENS
                     )
-                    
-                    final_answer = ""
-                    for chunk in final_stream:
-                        delta = chunk["choices"][0]["delta"].get("content", "")
-                        if delta:
-                            print(delta, end="", flush=True)
-                            final_answer += delta
-                    
+                    tool_manager.increment_count()
                     full_response = final_answer
                 else:
                     full_response = full_response.strip()
@@ -871,10 +883,26 @@ def main():
             
             if full_response:
                 cleaned_response = extract_final_response(full_response)
-                history.append((user_input, cleaned_response))
                 
-                # ==================== 提交原子事实提取任务 ====================
-                current_turn = len(history)
+                # ========== 核心修改：使用数据库的全局 turn ==========
+                # 递增全局对话轮次，获取本轮 turn
+                current_global_turn = memory_module_main.increment_turn()
+                
+                # ===== 1. 记录原始对话到 history.txt =====
+                dialogue_manager.add_dialogue(
+                    turn=current_global_turn,
+                    user_input=user_input,
+                    ai_response=cleaned_response
+                )
+                
+                # ===== 2. 获取用户向量并用于话题分割 =====
+                user_vector = model_manager.get_embedding(user_input)
+                topic_segmenter.add_turn_vector(current_global_turn, user_vector)
+                
+                # ===== 3. 记录到内存历史列表（使用全局 turn） =====
+                history.append((current_global_turn, user_input, cleaned_response))
+                
+                # ===== 4. 原子事实提取（异步） =====
                 pending = atomic_extract_queue.qsize()
                 window_len = kept_rounds
                 if window_len > 0:
@@ -884,10 +912,10 @@ def main():
                         print(f"[积压控制] 当前积压任务数 {pending} 超过限制 {limit}，等待降至 {target}...")
                         while atomic_extract_queue.qsize() > target:
                             time.sleep(1)
-                atomic_extract_queue.put((user_input, cleaned_response, current_turn))
-                print("[系统] 原子事实提取任务已提交到后台")
+                atomic_extract_queue.put((user_input, cleaned_response, current_global_turn))
+                print(f"[系统] 原子事实提取任务已提交到后台（轮次 {current_global_turn}）")
                 
-                # ==================== 处理已提取好的原子事实（存储）====================
+                # ===== 5. 处理已提取好的原子事实 =====
                 process_atomic_facts_queue(memory_module_main)
 
                 if len(history) % 10 == 0:
@@ -910,8 +938,9 @@ def main():
         process_atomic_facts_queue(memory_module_main)
         atomic_facts_queue.join()
         
-        if history:
-            save_conversation_log(history, "conversation_final.json")
+        # 确保最后一个话题被处理
+        topic_segmenter.finalize_topics()
+        
         try:
             memory_module_main.cleanup()
         except Exception as e:
@@ -919,6 +948,7 @@ def main():
         
         print("\n最终统计:")
         print_model_info()
+        print_dialogue_stats(dialogue_manager)
         print("程序结束")
 
 def quick_test():

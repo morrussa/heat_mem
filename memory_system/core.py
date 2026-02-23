@@ -31,11 +31,11 @@ from .utils import (
 from .infrastructure.database import Database
 from .infrastructure.cache import CacheManager
 from .infrastructure.locking import DistributedLockManager
-from .infrastructure.history import HistoryManager
+from .infrastructure.dialogue_manager import DialogueManager  # 替换 HistoryManager
 from .services.heat_system import HeatSystem
 from .services.cluster_service import ClusterService
 from .services.search_service import SearchService
-from .services.waypoint import WaypointService
+from .services.topic import TopicSegmenter
 
 
 # =============== 事务上下文 ===============
@@ -108,28 +108,6 @@ class TransactionContext:
         self.operations.append(operation)
         self.pool_updates += pool_delta
 
-    # ========== 新增方法：暂存热力单元操作 ==========
-    def add_pending_heat_unit(self, memory_id: str, vector: np.ndarray, pending_heat: int, created_turn: int):
-        """添加暂存热力单元"""
-        operation = {
-            'type': OperationType.PENDING_HEAT_UNIT_ADD,
-            'memory_id': memory_id,
-            'vector_blob': vector_to_blob(vector),
-            'pending_heat': pending_heat,
-            'created_turn': created_turn,
-            'transaction_id': self.transaction_id
-        }
-        self.operations.append(operation)
-
-    def delete_pending_heat_unit(self, memory_id: str):
-        """删除暂存热力单元（唤醒后）"""
-        operation = {
-            'type': OperationType.PENDING_HEAT_UNIT_DELETE,
-            'memory_id': memory_id,
-            'transaction_id': self.transaction_id
-        }
-        self.operations.append(operation)
-
     def add_atomic_memories(self, facts: List[str], user_input: str, ai_response: str,
                             metadata: Dict[str, Any] = None) -> List[str]:
         """将原子事实存储为独立的记忆项，并处理重复检测与合并"""
@@ -152,8 +130,8 @@ class TransactionContext:
             
             duplicate_id = self.memory_module._check_duplicate(fact_vector, fact)
             if duplicate_id:
-                print(f"[Memory] 发现重复原子事实，合并到已有记忆 {duplicate_id[:8]}...")
-                # 重复合并逻辑（省略，与原代码相同）
+                # print(f"[Memory] 发现重复原子事实，合并到已有记忆 {duplicate_id[:8]}...")
+                print(f"[Memory] 发现重复原子事实，合并到已有记忆 {duplicate_id[:8]}...，原子事实内容: {fact[:100]}{'...' if len(fact) > 100 else ''}")
                 self.memory_module.stats['duplicate_skipped_count'] += 1
                 memory_ids.append(duplicate_id)
                 print(f"[Memory] 原子事实已合并到记忆 {duplicate_id[:8]}...")
@@ -192,7 +170,7 @@ class TransactionContext:
 
 
 class MemoryModule:
-    def __init__(self, embedding_func=None, similarity_func=None):
+    def __init__(self, embedding_func=None, similarity_func=None, small_llm_func=None):
         self.config = Config()
 
         self.embedding_dim = self.config.EMBEDDING_DIM
@@ -211,6 +189,7 @@ class MemoryModule:
 
         self._external_embedding_func = embedding_func
         self._external_similarity_func = similarity_func
+        self.small_llm_func = small_llm_func
 
         if self._external_embedding_func is None:
             self._init_model()
@@ -284,23 +263,27 @@ class MemoryModule:
             'similarity_cache_misses': 0,
             'annoy_queries': 0,
             'annoy_fallback_searches': 0,
-            'history_records': 0,
-            'history_file_records': 0,
             'duplicate_skipped_count': 0,
-            'pending_heat_units': 0       # 新增：待处理暂存单元数量
         }
 
         # 服务层
         self.heat_system = HeatSystem(self)
         self.cluster_service = ClusterService(self)
         self.search_service = SearchService(self)
-        self.waypoint_service = WaypointService(self)
+        # WaypointService 已移除
 
-        self.history_manager = HistoryManager(
-            memory_module=self,
-            history_file=self.config.HISTORY_FILE_PATH,
-            max_memory_records=self.config.HISTORY_MAX_MEMORY_RECORDS,
-            max_disk_records=self.config.HISTORY_MAX_DISK_RECORDS
+        # 替换 HistoryManager 为 DialogueManager
+        self.dialogue_manager = DialogueManager(
+            history_file=self.config.HISTORY_FILE_PATH
+        )
+
+        # 初始化话题分割器，传入 dialogue_manager
+        idx_file_path = Path(self.config.HISTORY_FILE_PATH).with_suffix('.idx')
+        self.topic_segmenter = TopicSegmenter(
+            dialogue_manager=self.dialogue_manager,
+            similarity_threshold=0.4,
+            idx_file_path=idx_file_path,
+            small_llm_func=self.small_llm_func
         )
 
         self._load_system_state()
@@ -312,9 +295,64 @@ class MemoryModule:
 
     def add_atomic_memories(self, facts: List[str], user_input: str, ai_response: str,
                             metadata: Dict[str, Any] = None) -> List[str]:
-        """将原子事实存储为独立的记忆项"""
+        """将原子事实存储为独立的记忆项，并处理重复检测与合并"""
+        if metadata is None:
+            metadata = {}
+        
+        source_turn = metadata.get("turn", self.current_turn)
+        memory_ids = []
+        
+        if not facts:
+            return memory_ids
+        
+        print(f"[Memory] 开始存储 {len(facts)} 条原子事实...")
+        
+        # 创建事务上下文
         with TransactionContext(self, consistency_level=ConsistencyLevel.STRONG) as tx:
-            return tx.add_atomic_memories(facts, user_input, ai_response, metadata)
+            for i, fact in enumerate(facts):
+                if not fact or len(fact.strip()) < 5:
+                    continue
+                    
+                fact_vector = self._get_embedding(fact)
+                
+                duplicate_id = self._check_duplicate(fact_vector, fact)
+                if duplicate_id:
+                    print(f"[Memory] 发现重复原子事实，合并到已有记忆 {duplicate_id[:8]}...，原子事实内容: {fact[:100]}{'...' if len(fact) > 100 else ''}")
+                    self.stats['duplicate_skipped_count'] += 1
+                    memory_ids.append(duplicate_id)
+                    print(f"[Memory] 原子事实已合并到记忆 {duplicate_id[:8]}...")
+                    continue
+                
+                fact_id = hashlib.md5(f"{fact}_{source_turn}_{i}_{time.time()}".encode()).hexdigest()[:16]
+                
+                memory_id = self._create_memory_with_heat(
+                    user_input=fact,
+                    ai_response="",
+                    metadata={
+                        **metadata,
+                        "atomic_fact": fact,
+                        "fact_index": i,
+                        "parent_turn": source_turn,
+                        "parent_turns": [source_turn],
+                        "type": "atomic_fact",
+                        "source": "atomic_extraction"
+                    },
+                    current_turn=source_turn,
+                    memory_id=fact_id,
+                    user_vector=fact_vector,
+                    tx=tx  # 传递正确的事务上下文
+                )
+                
+                memory_ids.append(memory_id)
+                self.stats['hot_memories'] = self.stats.get('hot_memories', 0) + 1
+                self.stats['total_memories'] = self.stats.get('total_memories', 0) + 1
+                print(f"[Memory] 创建新原子记忆 {memory_id[:8]}...，关联原始对话轮次 {source_turn}")
+        
+        if memory_ids:
+            print(f"[Memory] 成功存储 {len(memory_ids)} 条原子事实")
+        
+        self._trigger_maintenance_if_needed()
+        return memory_ids
 
     def _init_model(self):
         """初始化嵌入模型"""
@@ -346,13 +384,13 @@ class MemoryModule:
         """搜索原子事实并聚合返回原始对话记忆"""
         return self.search_service.search_original_memories(query_text, query_vector, max_results)
 
-    # =============== 核心创建方法（修改部分） ===============
+    # =============== 核心创建方法 ===============
     def _create_memory_with_heat(self, user_input: str, ai_response: str, metadata: Dict[str, Any],
                                    current_turn: int, memory_id: str, user_vector: np.ndarray,
                                    tx: Optional['TransactionContext'] = None) -> str:
         """
         核心记忆创建方法：分配热力、分配簇、数据库插入、更新统计。
-        支持外部事务（传入 tx），否则自己创建事务。
+        只用于原子事实的存储。
         """
         own_tx = False
         if tx is None:
@@ -383,14 +421,14 @@ class MemoryModule:
             # 找到最适合的簇
             best_cluster_id, best_similarity = self._find_best_cluster_annoy(user_vector)
 
-            # 冷主导簇处理（传入新记忆ID和向量）
+            # 冷主导簇处理
             skip_neighbor_allocation = False
             new_memory_final_heat = allocated_heat
             if best_cluster_id and best_similarity >= self.config.CLUSTER_SIMILARITY_THRESHOLD:
                 new_memory_final_heat, skip_neighbor_allocation = self.heat_system.allocate_heat_with_cold_dominant(
                     best_cluster_id, allocated_heat, best_similarity, tx,
-                    new_memory_id=memory_id,               # 新增
-                    new_memory_vector=user_vector           # 新增
+                    new_memory_id=memory_id,
+                    new_memory_vector=user_vector
                 )
 
             # 从热力池扣除 allocated_heat
@@ -409,7 +447,7 @@ class MemoryModule:
                 metadata=metadata or {}
             )
 
-            # 邻居热力分配（非冷主导或冷主导但未跳过）
+            # 邻居热力分配
             if not skip_neighbor_allocation:
                 neighbors = self._find_neighbors(user_vector, exclude_id=memory_id)
                 if neighbors:
@@ -507,21 +545,6 @@ class MemoryModule:
                 memory.metadata.get("parent_turn")
             ))
 
-            # 添加历史记录
-            self.history_manager.add_history_record(
-                created_turn=current_turn,
-                memory_id=memory_id,
-                content_preview=summary
-            )
-
-            # Waypoint 建边
-            candidate_limit = 50
-            hot_items = list(self.hot_memories.items())
-            hot_items.sort(key=lambda x: x[1].heat, reverse=True)
-            candidate_memories = [mem for mem_id, mem in hot_items if mem_id != memory_id][:candidate_limit]
-            if candidate_memories:
-                self.waypoint_service.add_semantic_edges_for_new_memory(memory, candidate_memories)
-
             # 更新统计
             self.stats['hot_memories'] += 1
             self.stats['total_memories'] += 1
@@ -538,7 +561,18 @@ class MemoryModule:
                 tx.__exit__(type(e), e, e.__traceback__)
             raise
 
+    def increment_turn(self, increment_type: str = 'access') -> int:
+        """
+        递增全局对话轮次，并返回新值。
+        参数 increment_type 可选 'access'/'add'/'maintenance'，默认为 'access'。
+        """
+        return self._unified_turn_increment(increment_type)
+
     def _add_memory_internal(self, user_input: str, ai_response: str, metadata: Dict[str, Any] = None) -> str:
+        """
+        注意：此方法不再使用，原子事实存储走 add_atomic_memories
+        保留仅用于兼容，但移除了所有历史记录相关代码
+        """
         current_turn = self._unified_turn_increment('add')
         user_vector = self._get_embedding(user_input)
         summary = self._generate_summary(user_input, ai_response)
@@ -566,27 +600,28 @@ class MemoryModule:
                     WHERE id = ?
                 """, (current_turn, memory.access_count, duplicate_id))
             self.stats['duplicate_skipped_count'] += 1
-            self._trigger_maintenance_if_needed()
-            return duplicate_id
+            memory_id = duplicate_id
+        else:
+            memory_id = hashlib.md5(f"{user_input}_{ai_response}_{current_turn}".encode()).hexdigest()[:16]
+            self._create_memory_with_heat(
+                user_input=user_input,
+                ai_response=ai_response,
+                metadata=metadata,
+                current_turn=current_turn,
+                memory_id=memory_id,
+                user_vector=user_vector,
+                tx=None
+            )
 
-        memory_id = hashlib.md5(f"{user_input}_{ai_response}_{current_turn}".encode()).hexdigest()[:16]
-
-        return self._create_memory_with_heat(
-            user_input=user_input,
-            ai_response=ai_response,
-            metadata=metadata,
-            current_turn=current_turn,
-            memory_id=memory_id,
-            user_vector=user_vector,
-            tx=None
-        )
+        self._trigger_maintenance_if_needed()
+        return memory_id
 
     def _get_embedding(self, text: str) -> np.ndarray:
         if self._external_embedding_func is not None:
             return self._external_embedding_func(text)
         elif self.model:
             try:
-                return self.model.encode(text, show_progress_bar=False)
+                return self.model.encode([text], show_progress_bar=False)[0]
             except:
                 return self.model.encode(text)
         else:
@@ -607,7 +642,7 @@ class MemoryModule:
         return self.heat_system._update_unallocated_heat()
 
     def _load_system_state(self):
-        """加载系统状态（修改了 pending heat 部分）"""
+        """加载系统状态"""
         row = self.db.load_heat_pool_state()
         if row:
             self.heat_pool = row['heat_pool']
@@ -615,18 +650,6 @@ class MemoryModule:
             self.total_allocated_heat = row['total_allocated_heat']
             self.current_turn = row['current_turn']
             self.stats['current_turn'] = self.current_turn
-
-            # 不再加载旧的 pending_heat_table
-            # 改为加载 pending_heat_units 的数量统计
-            try:
-                self.cursor.execute(f"""
-                    SELECT COUNT(*) as cnt FROM {self.config.PENDING_HEAT_UNITS_TABLE}
-                    WHERE status = 'pending'
-                """)
-                cnt_row = self.cursor.fetchone()
-                self.stats['pending_heat_units'] = cnt_row['cnt'] if cnt_row else 0
-            except Exception as e:
-                print(f"Warning: Failed to load pending heat units: {e}")
 
         clusters = self.db.load_all_clusters()
         for cluster in clusters:
@@ -664,7 +687,7 @@ class MemoryModule:
             print(f"Warning: Failed to load access frequency stats: {e}")
 
     def _check_consistency(self):
-        """检查系统一致性（移除旧的 pending heat 相关部分）"""
+        """检查系统一致性"""
         print("Checking system consistency...")
         total_heat_in_memories = 0
         total_heat_in_clusters = 0
@@ -677,12 +700,7 @@ class MemoryModule:
         for cluster in self.clusters.values():
             total_heat_in_clusters += cluster.total_heat
 
-        # 计算 pending_heat_units 的总热力（可选）
-        self.cursor.execute(f"SELECT SUM(pending_heat) as total FROM {self.config.PENDING_HEAT_UNITS_TABLE} WHERE status='pending'")
-        row = self.cursor.fetchone()
-        total_pending = row['total'] or 0
-
-        expected_total_allocated = total_heat_in_memories + self.heat_pool + self.unallocated_heat + total_pending
+        expected_total_allocated = total_heat_in_memories + self.heat_pool + self.unallocated_heat
         expected_total_heat = self.config.TOTAL_HEAT
         if abs(expected_total_allocated - expected_total_heat) > 100:
             print(f"WARNING: Heat conservation violated! "
@@ -701,12 +719,11 @@ class MemoryModule:
               f"Clusters={total_heat_in_clusters:,}, "
               f"Pool={self.heat_pool:,}, "
               f"Unallocated={self.unallocated_heat:,}, "
-              f"Pending Units={total_pending:,}, "
-              f"Total={total_heat_in_memories + self.heat_pool + self.unallocated_heat + total_pending:,}")
+              f"Total={total_heat_in_memories + self.heat_pool + self.unallocated_heat:,}")
         print(f"Current turn: {self.current_turn}")
 
     def _repair_consistency(self):
-        """修复一致性（移除旧的 pending heat 相关部分）"""
+        """修复一致性"""
         print("Attempting to repair consistency...")
         for cluster_id, cluster in self.clusters.items():
             self.cursor.execute(f"""
@@ -740,11 +757,7 @@ class MemoryModule:
         row = self.cursor.fetchone()
         total_memory_heat = row['total_heat'] or 0
 
-        self.cursor.execute(f"SELECT SUM(pending_heat) as total FROM {self.config.PENDING_HEAT_UNITS_TABLE} WHERE status='pending'")
-        row = self.cursor.fetchone()
-        total_pending = row['total'] or 0
-
-        allocated_heat = total_memory_heat + self.heat_pool + total_pending
+        allocated_heat = total_memory_heat + self.heat_pool
         self.unallocated_heat = max(0, self.config.TOTAL_HEAT - allocated_heat)
 
         if self.heat_pool > self.config.INITIAL_HEAT_POOL and self.unallocated_heat < 0:
@@ -760,7 +773,6 @@ class MemoryModule:
         print(f"  Heat pool: {self.heat_pool:,}")
         print(f"  Unallocated heat: {self.unallocated_heat:,}")
         print(f"  Total memory heat: {total_memory_heat:,}")
-        print(f"  Pending heat units: {total_pending:,}")
         print("Consistency repair completed")
 
     def _unified_turn_increment(self, increment_type: str = 'access') -> int:
@@ -847,12 +859,6 @@ class MemoryModule:
                 self._apply_cluster_heat_update(operation, immediate)
             elif op_type == OperationType.POOL_HEAT_UPDATE:
                 self._apply_pool_update(operation, immediate)
-            # ========== 新增分支 ==========
-            elif op_type == OperationType.PENDING_HEAT_UNIT_ADD:
-                self._apply_pending_heat_unit_add(operation, immediate)
-            elif op_type == OperationType.PENDING_HEAT_UNIT_DELETE:
-                self._apply_pending_heat_unit_delete(operation, immediate)
-            # 旧的 PENDING_HEAT_UPDATE 已被移除
             if immediate:
                 self._log_operation(operation, applied=True)
         except Exception as e:
@@ -896,10 +902,7 @@ class MemoryModule:
                 self.heat_pool = 0
             total_memory_heat = sum(m.heat for m in self.hot_memories.values()) + \
                                 sum(m.heat for m in self.sleeping_memories.values())
-            self.cursor.execute(f"SELECT SUM(pending_heat) as total FROM {self.config.PENDING_HEAT_UNITS_TABLE} WHERE status='pending'")
-            row = self.cursor.fetchone()
-            total_pending = row['total'] if row and row['total'] else 0
-            self.unallocated_heat = max(0, self.config.TOTAL_HEAT - total_memory_heat - self.heat_pool - total_pending)
+            self.unallocated_heat = max(0, self.config.TOTAL_HEAT - total_memory_heat - self.heat_pool)
             if immediate:
                 self.cursor.execute(f"""
                     UPDATE {self.config.HEAT_POOL_TABLE}
@@ -907,33 +910,6 @@ class MemoryModule:
                     WHERE id = 1
                 """, (self.heat_pool, self.unallocated_heat))
         self._invalidate_related_caches(full=True)
-
-    # ========== 新增方法：处理暂存热力单元 ==========
-    def _apply_pending_heat_unit_add(self, operation: Dict, immediate: bool):
-        if immediate:
-            self.cursor.execute(f"""
-                INSERT INTO {self.config.PENDING_HEAT_UNITS_TABLE} 
-                (id, vector, pending_heat, created_turn, status, version)
-                VALUES (?, ?, ?, ?, 'pending', 1)
-            """, (
-                operation['memory_id'],
-                operation['vector_blob'],
-                operation['pending_heat'],
-                operation['created_turn']
-            ))
-            # 更新统计
-            self.stats['pending_heat_units'] += 1
-
-    def _apply_pending_heat_unit_delete(self, operation: Dict, immediate: bool):
-        if immediate:
-            self.cursor.execute(f"""
-                DELETE FROM {self.config.PENDING_HEAT_UNITS_TABLE}
-                WHERE id = ? AND status = 'pending'
-            """, (operation['memory_id'],))
-            # 减少统计（这里简单重新计数，也可用变量跟踪）
-            self.cursor.execute(f"SELECT COUNT(*) as cnt FROM {self.config.PENDING_HEAT_UNITS_TABLE} WHERE status='pending'")
-            row = self.cursor.fetchone()
-            self.stats['pending_heat_units'] = row['cnt'] if row else 0
 
     def _log_operation(self, operation: Dict, applied: bool = False):
         self.cursor.execute(f"""
@@ -986,7 +962,6 @@ class MemoryModule:
                     'turn': self.current_turn
                 }
                 self.update_queue.put(queue_item)
-            # 暂存单元操作通常需要立即生效，不放入队列，但也可以加入队列以支持异步，这里保持简单，不做队列
 
     def _trigger_maintenance_if_needed(self):
         need_maintenance = False
@@ -999,7 +974,6 @@ class MemoryModule:
 
         if need_maintenance:
             self._unified_turn_increment('maintenance')
-            # 在维护任务中，heat_system 会处理暂存单元
             if self.operation_count >= self.MAINTENANCE_OPERATION_THRESHOLD:
                 self.operation_count = 0
             if self.memory_addition_count >= self.CHECKPOINT_MEMORY_THRESHOLD:
@@ -1017,7 +991,7 @@ class MemoryModule:
             self._process_batch_updates(batch)
 
     def _process_batch_updates(self, batch: List[Dict]):
-        """批量处理更新（暂存单元不在此处理，因为它们是立即的）"""
+        """批量处理更新"""
         cluster_updates = defaultdict(int)
         cluster_centroid_updates = {}
         memory_updates = {}
@@ -1069,10 +1043,7 @@ class MemoryModule:
                         self.heat_pool = 0
                     total_memory_heat = sum(m.heat for m in self.hot_memories.values()) + \
                                         sum(m.heat for m in self.sleeping_memories.values())
-                    self.cursor.execute(f"SELECT SUM(pending_heat) as total FROM {self.config.PENDING_HEAT_UNITS_TABLE} WHERE status='pending'")
-                    row = self.cursor.fetchone()
-                    total_pending = row['total'] if row and row['total'] else 0
-                    self.unallocated_heat = max(0, self.config.TOTAL_HEAT - total_memory_heat - self.heat_pool - total_pending)
+                    self.unallocated_heat = max(0, self.config.TOTAL_HEAT - total_memory_heat - self.heat_pool)
                     self.cursor.execute(f"""
                         UPDATE {self.config.HEAT_POOL_TABLE}
                         SET heat_pool = ?, unallocated_heat = ?
@@ -1087,7 +1058,6 @@ class MemoryModule:
             self.cache_manager.weight_cache.clear()
 
     def _check_and_move_sleeping(self):
-        # 此方法不变，但需注意其中不再涉及 pending_heat_per_cluster
         if len(self.sleeping_memories) == 0:
             return
         for memory_id, memory in list(self.sleeping_memories.items()):
@@ -1132,10 +1102,6 @@ class MemoryModule:
             self.stats['hot_memories'] -= 1
             self.stats['cold_memories'] += 1
         self._invalidate_related_caches(full=True)
-
-    # 其他方法（_cleanup_access_frequency_stats, _cleanup_cluster_heat_history, 
-    # _create_checkpoint_if_needed, _create_checkpoint 等）不变，但需注意 _create_checkpoint 
-    # 中不再保存旧的 pending_heat_table，而是保存 pending_heat_units（可选，但状态已持久化，无需额外保存）
 
     def _cleanup_access_frequency_stats(self):
         with self.frequency_stats_lock:
@@ -1186,12 +1152,6 @@ class MemoryModule:
                     cluster.id
                 ))
 
-            # 不再保存旧的 pending_heat_table，因为 pending_heat_units 已经持久化
-            # 可选择性统计 pending_heat_units 数量
-            self.cursor.execute(f"SELECT COUNT(*) as cnt FROM {self.config.PENDING_HEAT_UNITS_TABLE} WHERE status='pending'")
-            cnt_row = self.cursor.fetchone()
-            self.stats['pending_heat_units'] = cnt_row['cnt'] if cnt_row else 0
-
             with self.heat_pool_lock:
                 self.cursor.execute(f"""
                     UPDATE {self.config.HEAT_POOL_TABLE}
@@ -1211,8 +1171,10 @@ class MemoryModule:
             print(f"[Memory System] Error creating checkpoint: {e}")
             self.conn.rollback()
 
-    # =============== 核心业务方法（不变） ===============
+    # =============== 核心业务方法 ===============
     def add_memory(self, user_input: str, ai_response: str, metadata: Dict[str, Any] = None) -> str:
+        """注意：此方法已废弃，请使用 add_atomic_memories 存储原子事实"""
+        print("[Warning] add_memory is deprecated, use add_atomic_memories for atomic facts")
         return self._add_memory_internal(user_input=user_input, ai_response=ai_response, metadata=metadata)
 
     def _generate_summary(self, user_input: str, ai_response: str) -> str:
@@ -1299,29 +1261,37 @@ class MemoryModule:
         if threshold is not None:
             self.config.DUPLICATE_THRESHOLD = threshold
 
-    # =============== 历史记录方法（不变） ===============
-    def get_memory_by_turn(self, created_turn: int) -> Optional[MemoryItem]:
-        return self.history_manager.get_memory_by_turn(created_turn)
+    # =============== 新增：对话管理器方法 ===============
+    def get_dialogue_by_turn(self, turn: int) -> Optional[Tuple[str, str]]:
+        """根据轮数获取原始对话 (user_input, ai_response)"""
+        return self.dialogue_manager.get_dialogue(turn)
 
-    def get_turn_by_memory_id(self, memory_id: str) -> Optional[int]:
-        return self.history_manager.get_turn_by_memory_id(memory_id)
+    def get_dialogues_in_range(self, start_turn: int, end_turn: int) -> List[Tuple[int, str, str]]:
+        """获取指定轮数范围内的所有原始对话，返回 [(turn, user, ai), ...]"""
+        return self.dialogue_manager.get_dialogues_in_range(start_turn, end_turn)
 
-    def get_memories_by_turn_range(self, start_turn: int, end_turn: int) -> List[MemoryItem]:
-        return self.history_manager.get_memories_by_turn_range(start_turn, end_turn)
+    def search_dialogues_by_keyword(self, keyword: str, max_results: int = 50) -> List[Tuple[int, str, str]]:
+        """按关键词搜索原始对话内容"""
+        return self.dialogue_manager.search_by_keyword(keyword, max_results)
 
-    def search_history_by_keyword(self, keyword: str, max_results: int = 50) -> List[Tuple[int, str, str]]:
-        return self.history_manager.search_by_content_keyword(keyword, max_results)
+    def get_dialogue_stats(self) -> dict:
+        """获取原始对话统计信息"""
+        return self.dialogue_manager.get_stats()
 
-    def get_history_stats(self) -> Dict[str, Any]:
-        return self.history_manager.get_history_stats()
+    # =============== 话题分割器方法 ===============
+    def get_topic_for_turn(self, turn: int) -> Optional[Tuple[int, int]]:
+        """获取指定轮数所属的话题范围"""
+        return self.topic_segmenter.get_topic_for_turn(turn)
 
-    def cleanup_old_history(self, max_age_turns: int = 100000):
-        return self.history_manager.cleanup_old_records(max_age_turns)
+    def get_topics_in_range(self, start_turn: int, end_turn: int) -> List[Tuple[int, int]]:
+        """获取与指定轮数范围有重叠的所有话题"""
+        return self.topic_segmenter.get_topics_in_range(start_turn, end_turn)
 
-    def rebuild_history_index(self):
-        return self.history_manager.rebuild_index()
+    def get_topic_summary(self, start: int, end: int) -> Optional[str]:
+        """获取话题的摘要"""
+        return self.topic_segmenter.get_summary_for_topic(start, end)
 
-    # =============== 搜索方法（不变） ===============
+    # =============== 搜索方法 ===============
     def search_layered_memories(self, query_text: str = None, query_vector: np.ndarray = None,
                                max_total_results: int = None,
                                config_override: Dict = None) -> Dict[str, LayeredSearchResult]:
@@ -1345,17 +1315,7 @@ class MemoryModule:
     def get_cluster_statistics(self, cluster_id: str) -> Dict[str, Any]:
         return self.cluster_service.get_cluster_statistics(cluster_id)
 
-    # =============== 联想图（Waypoint）相关方法（不变） ===============
-    def record_turn_memories(self, memory_ids: List[str]):
-        self.waypoint_service.add_cooccurrence_edges(memory_ids, self.current_turn)
-
-    def reinforce_waypoint_edges(self, seed_ids: List[str], hit_ids: List[str]):
-        self.waypoint_service.reinforce_edges_from_query(seed_ids, hit_ids)
-
-    def get_waypoint_stats(self) -> Dict[str, Any]:
-        return self.waypoint_service.get_stats()
-
-    # =============== 统计与清理（修改 stats 相关） ===============
+    # =============== 统计与清理 ===============
     def get_cache_stats(self) -> Dict[str, Any]:
         return self.cache_manager.get_stats()
 
@@ -1365,25 +1325,22 @@ class MemoryModule:
     def get_stats(self) -> Dict[str, Any]:
         with self.heat_pool_lock:
             stats = self.stats.copy()
-            # 更新 pending_heat_units 实时数量
-            self.cursor.execute(f"SELECT COUNT(*) as cnt FROM {self.config.PENDING_HEAT_UNITS_TABLE} WHERE status='pending'")
-            row = self.cursor.fetchone()
-            pending_cnt = row['cnt'] if row else 0
-            stats['pending_heat_units'] = pending_cnt
             stats.update({
                 'num_clusters': len(self.clusters),
                 'hot_memories_count': len(self.hot_memories),
                 'sleeping_memories_count': len(self.sleeping_memories),
                 'heat_pool': self.heat_pool,
                 'unallocated_heat': self.unallocated_heat,
-                # 旧的 pending_heat 已移除
                 'current_turn': self.current_turn,
-                'waypoint_edges': self.waypoint_service.get_stats().get('total_edges', 0),
+                # 添加对话统计
+                'total_dialogues': self.get_dialogue_stats().get('total_lines', 0),
+                'first_dialogue_turn': self.get_dialogue_stats().get('first_turn'),
+                'last_dialogue_turn': self.get_dialogue_stats().get('last_turn')
             })
             return stats
 
     def _perform_maintenance_tasks(self):
-        """执行维护任务（调用 heat_system 处理暂存单元）"""
+        """执行维护任务"""
         try:
             self._flush_update_queue()
             self._check_and_move_sleeping()
@@ -1393,16 +1350,14 @@ class MemoryModule:
             self._cleanup_cluster_heat_history()
             self.heat_system._audit_heat_balance()
             self._create_checkpoint_if_needed()
-            # ========== 新增：处理暂存热力单元 ==========
-            self.heat_system.process_pending_heat_units()
         except Exception as e:
             print(f"[Maintenance] Error during maintenance: {e}")
 
     def cleanup(self):
         print(f"\n[Memory System] Cleaning up memory module (Final turn: {self.current_turn})...")
 
-        # 先处理所有暂存单元（最后一次机会）
-        self.heat_system.process_pending_heat_units()
+        # 确保最后一个话题被处理
+        self.topic_segmenter.finalize_topics()
 
         self._perform_maintenance_tasks()
 

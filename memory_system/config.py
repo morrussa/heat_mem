@@ -1,20 +1,6 @@
 # =============== 配置常量 ===============
 class Config:
     
-    WAYPOINT_TABLE = "waypoint_edges"
-    WAYPOINT_MIN_WEIGHT = 0.1           # 边权重低于此值则删除
-    WAYPOINT_DEFAULT_WEIGHT = 0.5       # 新建边的默认权重
-    WAYPOINT_DECAY_FACTOR = 0.99        # 每轮衰减因子
-    WAYPOINT_MIN_DECAYED_WEIGHT = 0.01  # 衰减后低于此值的边不返回
-    WAYPOINT_REINFORCE_DELTA = 0.1      # 每次强化增量
-    WAYPOINT_COOCCUR_INCREMENT = 0.2    # 每次共现增量
-    WAYPOINT_SEMANTIC_LOW = 0.85        # 语义相似度下界
-    WAYPOINT_SEMANTIC_HIGH = 0.95       # 语义相似度上界
-    WAYPOINT_SEMANTIC_INIT_WEIGHT = 0.3 # 语义弱边的初始权重
-    WAYPOINT_MAX_HOPS = 1                # 联想最大深度（1或2）
-    WAYPOINT_MAX_RESULTS_PER_SEED = 3    # 每个种子最多联想结果
-    WAYPOINT_GLOBAL_MAX = 5              # 总联想结果上限
-    
     COLD_DOMINANT_HOT_COUNT_THRESHOLD = 3  # 热区记忆少于这个数认为冷主导
     COLD_DOMINANT_COLD_COUNT_MIN = 1        # 冷区记忆至少要有这个数
 

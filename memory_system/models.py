@@ -48,7 +48,7 @@ class MemoryItem:
 @dataclass
 class SemanticCluster:
     id: str
-    centroid: np.ndarray  # 只基于用户输入向量更新
+    centroid: np.ndarray
     total_heat: int = 0
     hot_memory_count: int = 0
     cold_memory_count: int = 0
@@ -91,27 +91,12 @@ class VectorCache:
     memory_ids: List[str] = None
     last_updated: float = 0
     is_valid: bool = False
-    
-# @dataclass
-# class PendingHeat:
-#     cluster_id: str
-#     pending_heat: int
-#     version: int = 1
-#     last_updated_turn: int = 0
-
-@dataclass
-class WaypointEdge:
-    source_id: str
-    target_id: str
-    weight: float
-    created_turn: int
-    last_updated_turn: int
 
 @dataclass
 class PendingHeatUnit:
-    id: str                          # 新记忆的ID（也是主键）
-    vector: np.ndarray                # 新记忆的向量
-    pending_heat: int                 # 暂存的热力值
-    created_turn: int                 # 创建时的轮数
-    status: str = "pending"           # 状态：pending / processing / done
+    id: str
+    vector: np.ndarray
+    pending_heat: int
+    created_turn: int
+    status: str = "pending"
     version: int = 1
